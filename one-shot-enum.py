@@ -417,7 +417,7 @@ def service_banner(service: Service) -> str:
 # =========================
 
 HTTP_METHODS = {"get", "post", "put", "patch", "delete", "options", "head", "trace"}
-LLM_CHAT_MESSAGE = "Hello, what can you help me with?"
+LLM_CHAT_MESSAGE = "Hello, what can you help me with and what are your capabilities?"
 HTTP_TIMEOUT_SECONDS = 5
 MAX_RESPONSE_CHARS = 6000
 
