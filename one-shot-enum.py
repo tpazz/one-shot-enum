@@ -16,6 +16,8 @@ Features:
     - Targeted TCP service scan (-Pn -T3 -sC -sV) on discovered open ports
 - Optional UDP:
     - UDP top-ports scan (-Pn -T3 -sU --top-ports N)
+- Optional LLM/API enum:
+    - With --llm, detect FastAPI/uvicorn-like services, list OpenAPI paths, and probe /chat
 - Output:
     - Always prints clean terminal summaries
     - Optional per-host folders/XML/reports/CSV via --save
@@ -28,6 +30,7 @@ Features:
 import argparse
 import csv
 import ipaddress
+import json
 import os
 import queue
 import re
@@ -37,11 +40,16 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 import xml.etree.ElementTree as ET
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+
+Service = Dict[str, Any]
 
 
 # =========================
@@ -343,8 +351,8 @@ def parse_open_ports(host_el: ET.Element, proto_filter: Optional[str] = None) ->
     return sorted(open_ports)
 
 
-def parse_service_details(host_el: ET.Element, proto_filter: Optional[str] = None) -> List[Dict[str, str]]:
-    services: List[Dict[str, str]] = []
+def parse_service_details(host_el: ET.Element, proto_filter: Optional[str] = None) -> List[Service]:
+    services: List[Service] = []
     ports_el = host_el.find("ports")
     if ports_el is None:
         return services
@@ -389,7 +397,7 @@ def parse_service_details(host_el: ET.Element, proto_filter: Optional[str] = Non
     return sorted(services, key=lambda x: int(x["port"]) if x["port"].isdigit() else 0)
 
 
-def service_banner(service: Dict[str, str]) -> str:
+def service_banner(service: Service) -> str:
     parts = []
     if service["tunnel"]:
         parts.append(service["tunnel"])
@@ -402,6 +410,217 @@ def service_banner(service: Dict[str, str]) -> str:
     if service["extrainfo"]:
         parts.append(f"({service['extrainfo']})")
     return " ".join(parts).strip() or "unknown"
+
+
+# =========================
+# FastAPI / LLM enumeration
+# =========================
+
+HTTP_METHODS = {"get", "post", "put", "patch", "delete", "options", "head", "trace"}
+LLM_CHAT_MESSAGE = "Hello, what can you help me with?"
+HTTP_TIMEOUT_SECONDS = 5
+MAX_RESPONSE_CHARS = 6000
+
+
+def resembles_fastapi_service(service: Service) -> bool:
+    haystack = " ".join([
+        service_banner(service),
+        service.get("scripts", ""),
+        service.get("service", ""),
+        service.get("product", ""),
+        service.get("extrainfo", ""),
+    ]).lower()
+
+    indicators = ("fastapi", "uvicorn", "swagger ui", "openapi")
+    return any(indicator in haystack for indicator in indicators)
+
+
+def service_base_url(target: str, service: Service) -> str:
+    tunnel = service.get("tunnel", "").lower()
+    name = service.get("service", "").lower()
+    port = str(service.get("port", "")).strip()
+    scheme = "https" if tunnel == "ssl" or name in ("https", "ssl/http") else "http"
+    return f"{scheme}://{target}:{port}" if port else f"{scheme}://{target}"
+
+
+def truncate_text(value: str, limit: int = MAX_RESPONSE_CHARS) -> str:
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "\n... [truncated]"
+
+
+def http_request(url: str,
+                 method: str = "GET",
+                 payload: Optional[Dict[str, Any]] = None,
+                 timeout: int = HTTP_TIMEOUT_SECONDS) -> Dict[str, Any]:
+    data = None
+    headers = {
+        "Accept": "application/json, text/plain;q=0.9, */*;q=0.8",
+        "User-Agent": "one-shot-enum/llm-enum",
+    }
+
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body_bytes = response.read()
+            status = response.getcode()
+    except urllib.error.HTTPError as exc:
+        body_bytes = exc.read()
+        status = exc.code
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return {
+            "ok": False,
+            "status": None,
+            "text": "",
+            "json": None,
+            "error": str(exc),
+        }
+
+    text = body_bytes.decode("utf-8", errors="replace")
+    parsed_json = None
+    try:
+        parsed_json = json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    return {
+        "ok": 200 <= status < 400,
+        "status": status,
+        "text": text,
+        "json": parsed_json,
+        "error": "",
+    }
+
+
+def format_response_body(response: Dict[str, Any]) -> str:
+    if response.get("json") is not None:
+        return truncate_text(json.dumps(response["json"], indent=2, sort_keys=True))
+    return truncate_text(response.get("text", "").strip())
+
+
+def parse_openapi_endpoints(openapi_doc: Any) -> List[Dict[str, str]]:
+    if not isinstance(openapi_doc, dict):
+        return []
+
+    paths = openapi_doc.get("paths", {})
+    if not isinstance(paths, dict):
+        return []
+
+    endpoints: List[Dict[str, str]] = []
+    for path, operations in paths.items():
+        if not isinstance(operations, dict):
+            continue
+        for method in operations:
+            if method.lower() in HTTP_METHODS:
+                endpoints.append({
+                    "method": method.upper(),
+                    "path": str(path),
+                })
+
+    return endpoints
+
+
+def enumerate_llm_service(target: str, service: Service) -> Dict[str, Any]:
+    base_url = service_base_url(target, service)
+    openapi_url = f"{base_url}/openapi.json"
+    openapi_response = http_request(openapi_url)
+
+    result: Dict[str, Any] = {
+        "base_url": base_url,
+        "openapi_url": openapi_url,
+        "openapi_status": openapi_response.get("status"),
+        "openapi_error": openapi_response.get("error", ""),
+        "endpoints": [],
+        "chat_attempted": False,
+        "chat_status": None,
+        "chat_error": "",
+        "chat_response": "",
+    }
+
+    if not openapi_response.get("ok") and not result["openapi_error"]:
+        result["openapi_error"] = "HTTP request failed"
+    elif openapi_response.get("json") is not None:
+        result["endpoints"] = parse_openapi_endpoints(openapi_response["json"])
+    elif not result["openapi_error"]:
+        result["openapi_error"] = "Response was not valid JSON"
+
+    chat_path = next(
+        (
+            endpoint["path"]
+            for endpoint in result["endpoints"]
+            if endpoint["path"].rstrip("/") == "/chat"
+        ),
+        "",
+    )
+
+    if chat_path:
+        chat_url = f"{base_url}{chat_path}"
+        chat_response = http_request(
+            chat_url,
+            method="POST",
+            payload={"message": LLM_CHAT_MESSAGE},
+        )
+        result["chat_attempted"] = True
+        result["chat_url"] = chat_url
+        result["chat_path"] = chat_path
+        result["chat_status"] = chat_response.get("status")
+        result["chat_error"] = chat_response.get("error", "")
+        result["chat_response"] = format_response_body(chat_response)
+
+    return result
+
+
+def run_llm_enumeration(target: str, tcp_services: List[Service]) -> None:
+    for service in tcp_services:
+        if not resembles_fastapi_service(service):
+            continue
+
+        port = service.get("port", "")
+        info(f"{target}:{port}: FastAPI/uvicorn-like service found; fetching OpenAPI")
+        service["llm_enum"] = enumerate_llm_service(target, service)
+
+
+def llm_enum_lines(llm_enum: Dict[str, Any]) -> List[str]:
+    lines: List[str] = ["LLM/API enum:"]
+    status = llm_enum.get("openapi_status")
+    status_text = f"status {status}" if status is not None else "no status"
+
+    if llm_enum.get("openapi_error"):
+        lines.append(f"  OpenAPI: {status_text}; {llm_enum['openapi_error']}")
+    else:
+        lines.append(f"  OpenAPI: {status_text}; {llm_enum.get('openapi_url', '')}")
+
+    endpoints = llm_enum.get("endpoints", [])
+    if endpoints:
+        lines.append("  Endpoints:")
+        for endpoint in endpoints:
+            lines.append(f"    {endpoint['method']:<6} {endpoint['path']}")
+    else:
+        lines.append("  Endpoints: none found")
+
+    if llm_enum.get("chat_attempted"):
+        chat_status = llm_enum.get("chat_status")
+        chat_status_text = f"status {chat_status}" if chat_status is not None else "no status"
+        chat_path = llm_enum.get("chat_path", "/chat")
+        lines.append(f"  POST {chat_path}: {chat_status_text}")
+        if llm_enum.get("chat_error"):
+            lines.append(f"    Error: {llm_enum['chat_error']}")
+        else:
+            response_body = llm_enum.get("chat_response", "").strip()
+            lines.append("    Response:")
+            if response_body:
+                lines.extend(f"      {line}" for line in response_body.splitlines())
+            else:
+                lines.append("      (empty response)")
+    else:
+        lines.append("  POST /chat: not advertised in OpenAPI")
+
+    return lines
 
 
 # =========================
@@ -536,8 +755,8 @@ def udp_scan(target: str, top_ports: int, outdir: Optional[Path]) -> Dict:
 def print_host_summary(ip_addr: str,
                        hostname: str,
                        extra: Dict[str, str],
-                       tcp_services: List[Dict[str, str]],
-                       udp_services: List[Dict[str, str]]) -> None:
+                       tcp_services: List[Service],
+                       udp_services: List[Service]) -> None:
     print("=" * 88)
     host_line = f"Host: {ip_addr}"
     if hostname:
@@ -564,6 +783,9 @@ def print_host_summary(ip_addr: str,
         print("-" * 88)
         for svc in tcp_services:
             print(f"{svc['port']:<10}{svc['protocol']:<8}{service_banner(svc)}")
+            if svc.get("llm_enum"):
+                for line in llm_enum_lines(svc["llm_enum"]):
+                    print(f"{'':<18}{line}")
             if svc["scripts"]:
                 for sline in svc["scripts"].splitlines():
                     print(f"{'':<18}└─ {sline}")
@@ -588,8 +810,8 @@ def write_host_report(outdir: Path,
                       ip_addr: str,
                       hostname: str,
                       extra: Dict[str, str],
-                      tcp_services: List[Dict[str, str]],
-                      udp_services: List[Dict[str, str]]) -> None:
+                      tcp_services: List[Service],
+                      udp_services: List[Service]) -> None:
     lines = []
     lines.append(f"Host: {ip_addr}" + (f" ({hostname})" if hostname else ""))
     if extra.get("mac"):
@@ -608,6 +830,9 @@ def write_host_report(outdir: Path,
     if tcp_services:
         for svc in tcp_services:
             lines.append(f"{svc['port']}/{svc['protocol']}: {service_banner(svc)}")
+            if svc.get("llm_enum"):
+                for line in llm_enum_lines(svc["llm_enum"]):
+                    lines.append(f"  {line}")
             if svc["scripts"]:
                 for sline in svc["scripts"].splitlines():
                     lines.append(f"  - {sline}")
@@ -681,6 +906,11 @@ def parse_args() -> argparse.Namespace:
         help="Top UDP ports to scan when --udp is enabled (default: 20)",
     )
     parser.add_argument(
+        "--llm",
+        action="store_true",
+        help="For FastAPI/uvicorn-like services, enumerate OpenAPI endpoints and probe /chat",
+    )
+    parser.add_argument(
         "--timing",
         choices=["T1", "T2", "T3", "T4", "T5"],
         default="T4",
@@ -734,6 +964,8 @@ def main() -> None:
     info("Service enum timing: T3")
     if args.udp:
         info(f"UDP enabled: top {args.udp_top_ports} ports (timing: T3)")
+    if args.llm:
+        info("LLM/API enum enabled for FastAPI/uvicorn-like services")
     info(f"Save output: {'yes' if args.save else 'no'}")
     if args.save and base_outdir:
         info(f"Output directory: {base_outdir}")
@@ -784,8 +1016,8 @@ def main() -> None:
         ip_addr = s1.get("ip", target)
         hostname = s1.get("hostname", "")
         extra: Dict[str, str] = {}
-        tcp_services: List[Dict[str, str]] = []
-        udp_services: List[Dict[str, str]] = []
+        tcp_services: List[Service] = []
+        udp_services: List[Service] = []
 
         if tcp_open_ports:
             try:
@@ -794,6 +1026,11 @@ def main() -> None:
                 hostname = tcp_result.get("hostname", hostname)
                 extra = tcp_result.get("extra", {})
                 tcp_services = tcp_result.get("services", [])
+                if args.llm:
+                    try:
+                        run_llm_enumeration(target, tcp_services)
+                    except Exception as exc:
+                        err(f"{target}: LLM/API enum failed: {exc}")
             except Exception as exc:
                 err(f"{target}: TCP service scan failed: {exc}")
         else:
