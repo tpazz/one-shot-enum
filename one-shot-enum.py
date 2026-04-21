@@ -17,7 +17,7 @@ Features:
 - Optional UDP:
     - UDP top-ports scan (-Pn -T3 -sU --top-ports N)
 - Optional LLM/API enum:
-    - With --llm, detect FastAPI/uvicorn-like services, list OpenAPI paths, and probe /chat
+    - With --llm, detect LLM/API-like services, list OpenAPI paths, probe useful config endpoints, and test /chat
 - Output:
     - Always prints clean terminal summaries
     - Optional per-host folders/XML/reports/CSV via --save
@@ -413,16 +413,101 @@ def service_banner(service: Service) -> str:
 
 
 # =========================
-# FastAPI / LLM enumeration
+# LLM/API enumeration
 # =========================
 
 HTTP_METHODS = {"get", "post", "put", "patch", "delete", "options", "head", "trace"}
 LLM_CHAT_MESSAGE = "Hello, what can you help me with and what are your capabilities?"
 HTTP_TIMEOUT_SECONDS = 5
+PROBE_TIMEOUT_SECONDS = 2
 MAX_RESPONSE_CHARS = 6000
+MAX_PROBE_PREVIEW_CHARS = 300
+LLM_SERVICE_INDICATORS = (
+    "fastapi",
+    "uvicorn",
+    "swagger ui",
+    "openapi",
+    "vcom-tunnel",
+    "teradataordbms",
+    "mcreport",
+    "ollama",
+    "openai",
+    "open-webui",
+    "lm studio",
+    "lmstudio",
+    "llama.cpp",
+    "llamacpp",
+    "llama",
+    "llm",
+    "vllm",
+    "litellm",
+    "langchain",
+    "langserve",
+    "gradio",
+    "text generation inference",
+    "text-generation-inference",
+    "tgi",
+    "kobold",
+    "text-generation-webui",
+    "oobabooga",
+    "mistral",
+    "anthropic",
+    "mcp",
+    "model context protocol",
+    "haystack",
+    "dify",
+    "flowise",
+    "anythingllm",
+    "localai",
+    "llamafile",
+)
+OPENAPI_CANDIDATE_PATHS = (
+    "/openapi.json",
+    "/api/openapi.json",
+    "/api/v1/openapi.json",
+    "/swagger.json",
+)
+LLM_PROBE_PATHS = (
+    "/.well-known/security.txt",
+    "/.well-known/openid-configuration",
+    "/.well-known/oauth-authorization-server",
+    "/.well-known/ai-plugin.json",
+    "/.well-known/agent.json",
+    "/agent.json",
+    "/ai-plugin.json",
+    "/openapi.json",
+    "/swagger.json",
+    "/api/openapi.json",
+    "/api/v1/openapi.json",
+    "/docs",
+    "/redoc",
+    "/swagger",
+    "/swagger-ui",
+    "/swagger-ui.html",
+    "/chat",
+    "/chat/",
+    "/v1/models",
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/embeddings",
+    "/api/tags",
+    "/api/generate",
+    "/api/chat",
+    "/mcp",
+    "/sse",
+    "/messages",
+    "/health",
+    "/healthz",
+    "/ready",
+    "/readyz",
+    "/metrics",
+    "/version",
+    "/config",
+    "/config.json",
+)
 
 
-def resembles_fastapi_service(service: Service) -> bool:
+def resembles_llm_service(service: Service) -> bool:
     haystack = " ".join([
         service_banner(service),
         service.get("scripts", ""),
@@ -431,8 +516,7 @@ def resembles_fastapi_service(service: Service) -> bool:
         service.get("extrainfo", ""),
     ]).lower()
 
-    indicators = ("fastapi", "uvicorn", "swagger ui", "openapi")
-    return any(indicator in haystack for indicator in indicators)
+    return any(indicator in haystack for indicator in LLM_SERVICE_INDICATORS)
 
 
 def service_base_url(target: str, service: Service) -> str:
@@ -469,13 +553,16 @@ def http_request(url: str,
         with urllib.request.urlopen(request, timeout=timeout) as response:
             body_bytes = response.read()
             status = response.getcode()
+            content_type = response.headers.get("Content-Type", "")
     except urllib.error.HTTPError as exc:
         body_bytes = exc.read()
         status = exc.code
+        content_type = exc.headers.get("Content-Type", "") if exc.headers else ""
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         return {
             "ok": False,
             "status": None,
+            "content_type": "",
             "text": "",
             "json": None,
             "error": str(exc),
@@ -491,6 +578,7 @@ def http_request(url: str,
     return {
         "ok": 200 <= status < 400,
         "status": status,
+        "content_type": content_type,
         "text": text,
         "json": parsed_json,
         "error": "",
@@ -501,6 +589,71 @@ def format_response_body(response: Dict[str, Any]) -> str:
     if response.get("json") is not None:
         return truncate_text(json.dumps(response["json"], indent=2, sort_keys=True))
     return truncate_text(response.get("text", "").strip())
+
+
+def probe_response_preview(response: Dict[str, Any]) -> str:
+    content_type = response.get("content_type", "").lower()
+    text = response.get("text", "").strip()
+
+    if response.get("json") is not None:
+        preview = json.dumps(response["json"], sort_keys=True)
+    elif "text/html" in content_type:
+        title_match = re.search(r"<title[^>]*>(.*?)</title>", text, flags=re.IGNORECASE | re.DOTALL)
+        preview = title_match.group(1).strip() if title_match else ""
+    elif "text/" in content_type or text.startswith(("Contact:", "Policy:", "{", "[")):
+        preview = " ".join(text.split())
+    else:
+        preview = ""
+
+    return truncate_text(preview, MAX_PROBE_PREVIEW_CHARS).replace("\n", " ")
+
+
+def is_interesting_probe_response(response: Dict[str, Any]) -> bool:
+    status = response.get("status")
+    if status is None:
+        return False
+    return 200 <= status < 400 or status in (401, 403, 405)
+
+
+def probe_llm_paths(base_url: str) -> List[Dict[str, Any]]:
+    hits: List[Dict[str, Any]] = []
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        future_map = {
+            executor.submit(
+                http_request,
+                f"{base_url}{path}",
+                timeout=PROBE_TIMEOUT_SECONDS,
+            ): (index, path)
+            for index, path in enumerate(LLM_PROBE_PATHS)
+        }
+
+        for future in as_completed(future_map):
+            index, path = future_map[future]
+            try:
+                response = future.result()
+            except Exception as exc:
+                response = {
+                    "ok": False,
+                    "status": None,
+                    "content_type": "",
+                    "text": "",
+                    "json": None,
+                    "error": str(exc),
+                }
+
+            if not is_interesting_probe_response(response):
+                continue
+
+            hits.append({
+                "index": index,
+                "path": path,
+                "status": response.get("status"),
+                "content_type": response.get("content_type", ""),
+                "preview": probe_response_preview(response),
+            })
+
+    return sorted(hits, key=lambda hit: hit["index"])
 
 
 def parse_openapi_endpoints(openapi_doc: Any) -> List[Dict[str, str]]:
@@ -516,38 +669,60 @@ def parse_openapi_endpoints(openapi_doc: Any) -> List[Dict[str, str]]:
         if not isinstance(operations, dict):
             continue
         for method in operations:
-            if method.lower() in HTTP_METHODS:
+            method_name = str(method)
+            if method_name.lower() in HTTP_METHODS:
                 endpoints.append({
-                    "method": method.upper(),
+                    "method": method_name.upper(),
                     "path": str(path),
                 })
 
     return endpoints
 
 
+def apply_openapi_response(result: Dict[str, Any], response: Dict[str, Any], url: str) -> None:
+    result["openapi_url"] = url
+    result["openapi_status"] = response.get("status")
+    result["openapi_error"] = response.get("error", "")
+    result["endpoints"] = []
+
+    if not response.get("ok") and not result["openapi_error"]:
+        result["openapi_error"] = "HTTP request failed"
+    elif response.get("json") is not None:
+        result["endpoints"] = parse_openapi_endpoints(response["json"])
+    elif not result["openapi_error"]:
+        result["openapi_error"] = "Response was not valid JSON"
+
+
 def enumerate_llm_service(target: str, service: Service) -> Dict[str, Any]:
     base_url = service_base_url(target, service)
-    openapi_url = f"{base_url}/openapi.json"
+    openapi_url = f"{base_url}{OPENAPI_CANDIDATE_PATHS[0]}"
     openapi_response = http_request(openapi_url)
 
     result: Dict[str, Any] = {
         "base_url": base_url,
-        "openapi_url": openapi_url,
-        "openapi_status": openapi_response.get("status"),
-        "openapi_error": openapi_response.get("error", ""),
+        "openapi_url": "",
+        "openapi_status": None,
+        "openapi_error": "",
         "endpoints": [],
+        "probe_count": len(LLM_PROBE_PATHS),
+        "probe_hits": [],
         "chat_attempted": False,
         "chat_status": None,
         "chat_error": "",
         "chat_response": "",
     }
 
-    if not openapi_response.get("ok") and not result["openapi_error"]:
-        result["openapi_error"] = "HTTP request failed"
-    elif openapi_response.get("json") is not None:
-        result["endpoints"] = parse_openapi_endpoints(openapi_response["json"])
-    elif not result["openapi_error"]:
-        result["openapi_error"] = "Response was not valid JSON"
+    apply_openapi_response(result, openapi_response, openapi_url)
+    if not result["endpoints"]:
+        for openapi_path in OPENAPI_CANDIDATE_PATHS[1:]:
+            candidate_url = f"{base_url}{openapi_path}"
+            candidate_response = http_request(candidate_url)
+            candidate_endpoints = parse_openapi_endpoints(candidate_response.get("json"))
+            if candidate_endpoints:
+                apply_openapi_response(result, candidate_response, candidate_url)
+                break
+
+    result["probe_hits"] = probe_llm_paths(base_url)
 
     chat_path = next(
         (
@@ -557,6 +732,15 @@ def enumerate_llm_service(target: str, service: Service) -> Dict[str, Any]:
         ),
         "",
     )
+    if not chat_path:
+        chat_path = next(
+            (
+                hit["path"]
+                for hit in result["probe_hits"]
+                if hit["path"].rstrip("/") == "/chat"
+            ),
+            "",
+        )
 
     if chat_path:
         chat_url = f"{base_url}{chat_path}"
@@ -577,11 +761,11 @@ def enumerate_llm_service(target: str, service: Service) -> Dict[str, Any]:
 
 def run_llm_enumeration(target: str, tcp_services: List[Service]) -> None:
     for service in tcp_services:
-        if not resembles_fastapi_service(service):
+        if not resembles_llm_service(service):
             continue
 
         port = service.get("port", "")
-        info(f"{target}:{port}: FastAPI/uvicorn-like service found; fetching OpenAPI")
+        info(f"{target}:{port}: LLM/API-like service found; probing endpoints")
         service["llm_enum"] = enumerate_llm_service(target, service)
 
 
@@ -603,6 +787,19 @@ def llm_enum_lines(llm_enum: Dict[str, Any]) -> List[str]:
     else:
         lines.append("  Endpoints: none found")
 
+    probe_hits = llm_enum.get("probe_hits", [])
+    probe_count = llm_enum.get("probe_count", len(LLM_PROBE_PATHS))
+    if probe_hits:
+        lines.append(f"  Path probes: {len(probe_hits)} interesting of {probe_count} checked")
+        for hit in probe_hits:
+            status = hit.get("status", "")
+            line = f"    {status:<3} {hit.get('path', '')}"
+            if hit.get("preview"):
+                line += f" - {hit['preview']}"
+            lines.append(line)
+    else:
+        lines.append(f"  Path probes: no interesting responses from {probe_count} checked")
+
     if llm_enum.get("chat_attempted"):
         chat_status = llm_enum.get("chat_status")
         chat_status_text = f"status {chat_status}" if chat_status is not None else "no status"
@@ -618,7 +815,7 @@ def llm_enum_lines(llm_enum: Dict[str, Any]) -> List[str]:
             else:
                 lines.append("      (empty response)")
     else:
-        lines.append("  POST /chat: not advertised in OpenAPI")
+        lines.append("  POST /chat: not found in OpenAPI or path probes")
 
     return lines
 
@@ -908,7 +1105,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--llm",
         action="store_true",
-        help="For FastAPI/uvicorn-like services, enumerate OpenAPI endpoints and probe /chat",
+        help="For LLM/API-like services, enumerate OpenAPI, probe config paths, and test /chat",
     )
     parser.add_argument(
         "--timing",
@@ -965,7 +1162,7 @@ def main() -> None:
     if args.udp:
         info(f"UDP enabled: top {args.udp_top_ports} ports (timing: T3)")
     if args.llm:
-        info("LLM/API enum enabled for FastAPI/uvicorn-like services")
+        info("LLM/API enum enabled for matching services")
     info(f"Save output: {'yes' if args.save else 'no'}")
     if args.save and base_outdir:
         info(f"Output directory: {base_outdir}")
