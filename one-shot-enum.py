@@ -17,7 +17,8 @@ Features:
 - Optional UDP:
     - UDP top-ports scan (-Pn -T3 -sU --top-ports N)
 - Optional LLM/API enum:
-    - With --llm, detect LLM/API-like services, list OpenAPI paths, probe useful config endpoints, and test /chat
+    - With --llm, detect LLM/API-like services, list OpenAPI paths, and probe useful config endpoints
+    - With --hello, send a test prompt to /chat when discovered
 - Output:
     - Always prints clean terminal summaries
     - Optional per-host folders/XML/reports/CSV via --save
@@ -693,7 +694,7 @@ def apply_openapi_response(result: Dict[str, Any], response: Dict[str, Any], url
         result["openapi_error"] = "Response was not valid JSON"
 
 
-def enumerate_llm_service(target: str, service: Service) -> Dict[str, Any]:
+def enumerate_llm_service(target: str, service: Service, send_hello: bool = False) -> Dict[str, Any]:
     base_url = service_base_url(target, service)
     openapi_url = f"{base_url}{OPENAPI_CANDIDATE_PATHS[0]}"
     openapi_response = http_request(openapi_url)
@@ -706,6 +707,7 @@ def enumerate_llm_service(target: str, service: Service) -> Dict[str, Any]:
         "endpoints": [],
         "probe_count": len(LLM_PROBE_PATHS),
         "probe_hits": [],
+        "chat_path": "",
         "chat_attempted": False,
         "chat_status": None,
         "chat_error": "",
@@ -742,7 +744,9 @@ def enumerate_llm_service(target: str, service: Service) -> Dict[str, Any]:
             "",
         )
 
-    if chat_path:
+    result["chat_path"] = chat_path
+
+    if chat_path and send_hello:
         chat_url = f"{base_url}{chat_path}"
         chat_response = http_request(
             chat_url,
@@ -751,7 +755,6 @@ def enumerate_llm_service(target: str, service: Service) -> Dict[str, Any]:
         )
         result["chat_attempted"] = True
         result["chat_url"] = chat_url
-        result["chat_path"] = chat_path
         result["chat_status"] = chat_response.get("status")
         result["chat_error"] = chat_response.get("error", "")
         result["chat_response"] = format_response_body(chat_response)
@@ -759,14 +762,14 @@ def enumerate_llm_service(target: str, service: Service) -> Dict[str, Any]:
     return result
 
 
-def run_llm_enumeration(target: str, tcp_services: List[Service]) -> None:
+def run_llm_enumeration(target: str, tcp_services: List[Service], send_hello: bool = False) -> None:
     for service in tcp_services:
         if not resembles_llm_service(service):
             continue
 
         port = service.get("port", "")
         info(f"{target}:{port}: LLM/API-like service found; probing endpoints")
-        service["llm_enum"] = enumerate_llm_service(target, service)
+        service["llm_enum"] = enumerate_llm_service(target, service, send_hello=send_hello)
 
 
 def llm_enum_lines(llm_enum: Dict[str, Any]) -> List[str]:
@@ -814,6 +817,8 @@ def llm_enum_lines(llm_enum: Dict[str, Any]) -> List[str]:
                 lines.extend(f"      {line}" for line in response_body.splitlines())
             else:
                 lines.append("      (empty response)")
+    elif llm_enum.get("chat_path"):
+        lines.append(f"  POST {llm_enum['chat_path']}: discovered; use --hello to send test prompt")
     else:
         lines.append("  POST /chat: not found in OpenAPI or path probes")
 
@@ -1105,7 +1110,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--llm",
         action="store_true",
-        help="For LLM/API-like services, enumerate OpenAPI, probe config paths, and test /chat",
+        help="For LLM/API-like services, enumerate OpenAPI and probe config paths",
+    )
+    parser.add_argument(
+        "--hello",
+        action="store_true",
+        help="Send a test prompt to /chat when discovered during LLM/API enum",
     )
     parser.add_argument(
         "--timing",
@@ -1133,6 +1143,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     check_nmap_installed()
     args = parse_args()
+    if args.hello:
+        args.llm = True
 
     try:
         targets = normalize_targets(args.targets)
@@ -1163,6 +1175,8 @@ def main() -> None:
         info(f"UDP enabled: top {args.udp_top_ports} ports (timing: T3)")
     if args.llm:
         info("LLM/API enum enabled for matching services")
+    if args.hello:
+        info("Hello prompt enabled for discovered /chat endpoints")
     info(f"Save output: {'yes' if args.save else 'no'}")
     if args.save and base_outdir:
         info(f"Output directory: {base_outdir}")
@@ -1225,7 +1239,7 @@ def main() -> None:
                 tcp_services = tcp_result.get("services", [])
                 if args.llm:
                     try:
-                        run_llm_enumeration(target, tcp_services)
+                        run_llm_enumeration(target, tcp_services, send_hello=args.hello)
                     except Exception as exc:
                         err(f"{target}: LLM/API enum failed: {exc}")
             except Exception as exc:
