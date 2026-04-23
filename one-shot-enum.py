@@ -12,6 +12,9 @@ Features:
     - full ranges:        10.10.10.10-10.10.10.30
 - Stage 1:
     - Fast TCP full-port discovery scan (-Pn -T<1-5> -p- --open)
+    - Optional TCP targeted discovery on user-specified ports/ranges via --ports
+- Best-effort host discovery / OS fingerprint:
+    - Attempts lightweight OS detection first; if unavailable, scanning continues with -Pn
 - Stage 2:
     - Targeted TCP service scan (-Pn -T3 -sC -sV) on discovered open ports
 - Optional UDP:
@@ -116,6 +119,7 @@ def clear_progress_line() -> None:
 OPEN_PORT_RE = re.compile(r"Discovered open port (\d+)/(tcp|udp) on ([0-9.]+)")
 STATS_RE = re.compile(r"Stats:\s*(.*)")
 PERCENT_RE = re.compile(r"About\s+([0-9.]+)%\s+done", re.IGNORECASE)
+HOST_FINGERPRINT_TOP_PORTS = 20
 
 
 def check_nmap_installed() -> None:
@@ -191,6 +195,47 @@ def normalize_targets(raw_targets: List[str]) -> List[str]:
     return sorted(expanded, key=ip_to_int)
 
 
+def parse_port_spec(port_spec: str) -> List[int]:
+    ports: Set[int] = set()
+
+    for raw_item in port_spec.split(","):
+        item = raw_item.strip()
+        if not item:
+            continue
+
+        if "-" in item:
+            left, right = item.split("-", 1)
+            try:
+                start = int(left.strip())
+                end = int(right.strip())
+            except ValueError as exc:
+                raise ValueError(f"Invalid port range '{item}'") from exc
+
+            if not (1 <= start <= 65535 and 1 <= end <= 65535):
+                raise ValueError(f"Port range '{item}' must be between 1 and 65535")
+            if end < start:
+                raise ValueError(f"Invalid port range '{item}': end is before start")
+
+            for port in range(start, end + 1):
+                ports.add(port)
+            continue
+
+        try:
+            port = int(item)
+        except ValueError as exc:
+            raise ValueError(f"Invalid port '{item}'") from exc
+
+        if not (1 <= port <= 65535):
+            raise ValueError(f"Port '{item}' must be between 1 and 65535")
+
+        ports.add(port)
+
+    if not ports:
+        raise ValueError("No valid ports supplied in --ports")
+
+    return sorted(ports)
+
+
 def write_text(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
@@ -200,6 +245,15 @@ def parse_xml_file(xml_path: Path) -> ET.Element:
         return ET.parse(xml_path).getroot()
     except ET.ParseError as exc:
         raise RuntimeError(f"Failed to parse nmap XML from {xml_path}: {exc}") from exc
+
+
+def merge_extra_info(*extras: Dict[str, str]) -> Dict[str, str]:
+    merged: Dict[str, str] = {}
+    for extra in extras:
+        for key, value in extra.items():
+            if value:
+                merged[key] = value
+    return merged
 
 
 # =========================
@@ -829,15 +883,84 @@ def llm_enum_lines(llm_enum: Dict[str, Any]) -> List[str]:
 # Scan logic
 # =========================
 
-def tcp_discovery_scan(target: str, outdir: Optional[Path], timing: str) -> Dict:
+def host_fingerprint_scan(target: str,
+                          outdir: Optional[Path],
+                          ports: Optional[List[int]] = None) -> Dict:
+    with tempfile.TemporaryDirectory(prefix="nmapwrap_") as tmpdir:
+        xml_path = Path(tmpdir) / "host_fingerprint.xml"
+
+        cmd = [
+            "nmap",
+            "-O",
+            "--osscan-guess",
+            "--max-os-tries", "1",
+            "-v",
+            "--stats-every", "5s",
+        ]
+
+        if ports:
+            cmd.extend(["-p", ",".join(str(port) for port in ports)])
+        else:
+            cmd.extend(["--top-ports", str(HOST_FINGERPRINT_TOP_PORTS)])
+
+        cmd.extend(["-oX", str(xml_path), target])
+
+        rc, output = run_nmap_with_progress(cmd, target, phase="HOST-FP", proto="")
+
+        if rc not in (0, 1) or not xml_path.exists():
+            return {
+                "ip": target,
+                "hostname": "",
+                "extra": {},
+                "nmap_output": output,
+            }
+
+        if outdir:
+            shutil.copy2(xml_path, outdir / "host_fingerprint.xml")
+
+        try:
+            root = parse_xml_file(xml_path)
+        except RuntimeError:
+            return {
+                "ip": target,
+                "hostname": "",
+                "extra": {},
+                "nmap_output": output,
+            }
+
+        host_el = root.find("host")
+        if host_el is None:
+            return {
+                "ip": target,
+                "hostname": "",
+                "extra": {},
+                "nmap_output": output,
+            }
+
+        ip_addr, hostname = get_host_identifier(host_el)
+        extra = get_extra_host_info(host_el)
+        return {
+            "ip": ip_addr,
+            "hostname": hostname,
+            "extra": extra,
+            "nmap_output": output,
+        }
+
+
+def tcp_discovery_scan(target: str,
+                       outdir: Optional[Path],
+                       timing: str,
+                       ports: Optional[List[int]] = None) -> Dict:
     with tempfile.TemporaryDirectory(prefix="nmapwrap_") as tmpdir:
         xml_path = Path(tmpdir) / "tcp_discovery.xml"
+        port_arg = ",".join(str(port) for port in ports) if ports else "-"
+        fingerprint = host_fingerprint_scan(target, outdir, ports)
 
         cmd = [
             "nmap",
             "-Pn",
             f"-{timing}",
-            "-p-",
+            f"-p{port_arg}",
             "--open",
             "-v",
             "--stats-every", "5s",
@@ -856,15 +979,25 @@ def tcp_discovery_scan(target: str, outdir: Optional[Path], timing: str) -> Dict
         root = parse_xml_file(xml_path)
         host_el = root.find("host")
         if host_el is None:
-            return {"target": target, "open_ports": []}
+            return {
+                "target": target,
+                "ip": fingerprint.get("ip", target),
+                "hostname": fingerprint.get("hostname", ""),
+                "extra": fingerprint.get("extra", {}),
+                "open_ports": [],
+            }
 
         open_ports = parse_open_ports(host_el, proto_filter="tcp")
         ip_addr, hostname = get_host_identifier(host_el)
+        if ip_addr == "unknown":
+            ip_addr = fingerprint.get("ip", target)
+        hostname = hostname or fingerprint.get("hostname", "")
 
         return {
             "target": target,
             "ip": ip_addr,
             "hostname": hostname,
+            "extra": fingerprint.get("extra", {}),
             "open_ports": open_ports,
             "nmap_output": output,
         }
@@ -1108,6 +1241,10 @@ def parse_args() -> argparse.Namespace:
         help="Top UDP ports to scan when --udp is enabled (default: 20)",
     )
     parser.add_argument(
+        "--ports",
+        help="Comma-separated TCP ports and ranges to scan instead of a full-port discovery pass (example: 80,443,8000-8010)",
+    )
+    parser.add_argument(
         "--llm",
         action="store_true",
         help="For LLM/API-like services, enumerate OpenAPI and probe config paths",
@@ -1152,6 +1289,12 @@ def main() -> None:
         err(str(exc))
         sys.exit(1)
 
+    try:
+        selected_tcp_ports = parse_port_spec(args.ports) if args.ports else []
+    except ValueError as exc:
+        err(str(exc))
+        sys.exit(1)
+
     if not targets:
         err("No valid targets supplied.")
         sys.exit(1)
@@ -1170,6 +1313,12 @@ def main() -> None:
     good(f"Targets queued: {len(targets)}")
     info(f"Stage-1 threads: {args.threads}")
     info(f"Stage-1 timing: {args.timing}")
+    if selected_tcp_ports:
+        info("Host fingerprint: best effort OS detection on the selected TCP ports before -Pn fallback")
+        info(f"Stage-1 TCP port scope: {args.ports}")
+    else:
+        info(f"Host fingerprint: best effort OS detection on top {HOST_FINGERPRINT_TOP_PORTS} ports before -Pn fallback")
+        info("Stage-1 TCP port scope: full port range")
     info("Service enum timing: T3")
     if args.udp:
         info(f"UDP enabled: top {args.udp_top_ports} ports (timing: T3)")
@@ -1182,12 +1331,21 @@ def main() -> None:
         info(f"Output directory: {base_outdir}")
     print()
 
-    good("Starting TCP full-port discovery scans...")
+    if selected_tcp_ports:
+        good("Starting targeted TCP discovery scans...")
+    else:
+        good("Starting TCP full-port discovery scans...")
     stage1_results: Dict[str, Dict] = {}
 
     with ThreadPoolExecutor(max_workers=args.threads) as executor:
         future_map = {
-            executor.submit(tcp_discovery_scan, target, target_dirs[target], args.timing): target
+            executor.submit(
+                tcp_discovery_scan,
+                target,
+                target_dirs[target],
+                args.timing,
+                selected_tcp_ports or None,
+            ): target
             for target in targets
         }
 
@@ -1207,6 +1365,7 @@ def main() -> None:
                     "target": target,
                     "ip": target,
                     "hostname": "",
+                    "extra": {},
                     "open_ports": [],
                     "error": str(exc),
                 }
@@ -1226,7 +1385,7 @@ def main() -> None:
 
         ip_addr = s1.get("ip", target)
         hostname = s1.get("hostname", "")
-        extra: Dict[str, str] = {}
+        extra: Dict[str, str] = s1.get("extra", {})
         tcp_services: List[Service] = []
         udp_services: List[Service] = []
 
@@ -1235,7 +1394,7 @@ def main() -> None:
                 tcp_result = tcp_service_scan(target, tcp_open_ports, host_dir)
                 ip_addr = tcp_result.get("ip", ip_addr)
                 hostname = tcp_result.get("hostname", hostname)
-                extra = tcp_result.get("extra", {})
+                extra = merge_extra_info(extra, tcp_result.get("extra", {}))
                 tcp_services = tcp_result.get("services", [])
                 if args.llm:
                     try:
