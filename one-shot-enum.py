@@ -477,6 +477,7 @@ HTTP_TIMEOUT_SECONDS = 5
 PROBE_TIMEOUT_SECONDS = 2
 MAX_RESPONSE_CHARS = 6000
 MAX_PROBE_PREVIEW_CHARS = 300
+MAX_PROBE_JSON_PREVIEW_LINES = 24
 LLM_SERVICE_INDICATORS = (
     "fastapi",
     "uvicorn",
@@ -646,12 +647,26 @@ def format_response_body(response: Dict[str, Any]) -> str:
     return truncate_text(response.get("text", "").strip())
 
 
+def format_probe_json_preview(response: Dict[str, Any]) -> List[str]:
+    if response.get("json") is None:
+        return []
+
+    pretty_json = json.dumps(response["json"], indent=2, sort_keys=True)
+    lines = pretty_json.splitlines()
+    if len(lines) <= MAX_PROBE_JSON_PREVIEW_LINES:
+        return lines
+
+    truncated = lines[:MAX_PROBE_JSON_PREVIEW_LINES]
+    truncated.append("... [truncated]")
+    return truncated
+
+
 def probe_response_preview(response: Dict[str, Any]) -> str:
     content_type = response.get("content_type", "").lower()
     text = response.get("text", "").strip()
 
     if response.get("json") is not None:
-        preview = json.dumps(response["json"], sort_keys=True)
+        preview = ""
     elif "text/html" in content_type:
         title_match = re.search(r"<title[^>]*>(.*?)</title>", text, flags=re.IGNORECASE | re.DOTALL)
         preview = title_match.group(1).strip() if title_match else ""
@@ -706,6 +721,7 @@ def probe_llm_paths(base_url: str) -> List[Dict[str, Any]]:
                 "status": response.get("status"),
                 "content_type": response.get("content_type", ""),
                 "preview": probe_response_preview(response),
+                "json_preview_lines": format_probe_json_preview(response),
             })
 
     return sorted(hits, key=lambda hit: hit["index"])
@@ -854,6 +870,8 @@ def llm_enum_lines(llm_enum: Dict[str, Any]) -> List[str]:
             if hit.get("preview"):
                 line += f" - {hit['preview']}"
             lines.append(line)
+            for json_line in hit.get("json_preview_lines", []):
+                lines.append(f"      {json_line}")
     else:
         lines.append(f"  Path probes: no interesting responses from {probe_count} checked")
 
