@@ -477,7 +477,6 @@ HTTP_TIMEOUT_SECONDS = 5
 PROBE_TIMEOUT_SECONDS = 2
 MAX_RESPONSE_CHARS = 6000
 MAX_PROBE_PREVIEW_CHARS = 300
-MAX_PROBE_JSON_PREVIEW_LINES = 24
 LLM_SERVICE_INDICATORS = (
     "fastapi",
     "uvicorn",
@@ -652,13 +651,7 @@ def format_probe_json_preview(response: Dict[str, Any]) -> List[str]:
         return []
 
     pretty_json = json.dumps(response["json"], indent=2, sort_keys=True)
-    lines = pretty_json.splitlines()
-    if len(lines) <= MAX_PROBE_JSON_PREVIEW_LINES:
-        return lines
-
-    truncated = lines[:MAX_PROBE_JSON_PREVIEW_LINES]
-    truncated.append("... [truncated]")
-    return truncated
+    return pretty_json.splitlines()
 
 
 def probe_response_preview(response: Dict[str, Any]) -> str:
