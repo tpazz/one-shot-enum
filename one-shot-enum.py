@@ -23,6 +23,8 @@ Features:
 - Optional LLM/API enum:
     - With --llm, detect LLM/API-like services, list OpenAPI paths, and probe useful config endpoints
     - With --hello, send a test prompt to /chat when discovered
+- Local fallback:
+    - If nmap is missing, localhost scans fall back to pure-Python TCP/service checks
 - Output:
     - Always prints clean terminal summaries
     - Optional per-host folders/XML/reports/CSV via --save
@@ -37,9 +39,12 @@ import csv
 import ipaddress
 import json
 import os
+import platform
 import queue
 import re
 import shutil
+import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -77,6 +82,11 @@ def supports_color() -> bool:
 
 
 USE_COLOR = supports_color()
+
+
+def set_color_mode(enabled: bool) -> None:
+    global USE_COLOR
+    USE_COLOR = enabled
 
 
 def color(text: str, code: str) -> str:
@@ -122,10 +132,17 @@ STATS_RE = re.compile(r"Stats:\s*(.*)")
 PERCENT_RE = re.compile(r"About\s+([0-9.]+)%\s+done", re.IGNORECASE)
 HOST_FINGERPRINT_TOP_PORTS = 20
 LOCALHOST_TARGETS = {"localhost", "127.0.0.1", "::1"}
+LOCALHOST_CONNECT_TIMEOUT = 0.25
+LOCALHOST_READ_TIMEOUT = 0.4
+LOCALHOST_SCAN_WORKERS = 256
+
+
+def nmap_installed() -> bool:
+    return shutil.which("nmap") is not None
 
 
 def check_nmap_installed() -> None:
-    if shutil.which("nmap") is None:
+    if not nmap_installed():
         err("nmap not found in PATH.")
         sys.exit(1)
 
@@ -285,6 +302,170 @@ def merge_extra_info(*extras: Dict[str, str]) -> Dict[str, str]:
             if value:
                 merged[key] = value
     return merged
+
+
+def localhost_socket_candidates(target: str, port: int) -> List[Tuple[int, tuple]]:
+    normalized = target.strip().lower()
+    candidates: List[Tuple[int, tuple]] = []
+
+    if normalized in ("localhost", "::1") and socket.has_ipv6:
+        candidates.append((socket.AF_INET6, ("::1", port, 0, 0)))
+    if normalized in ("localhost", "127.0.0.1"):
+        candidates.append((socket.AF_INET, ("127.0.0.1", port)))
+    if normalized == "::1" and not socket.has_ipv6:
+        candidates = []
+
+    return candidates
+
+
+def connect_to_localhost(target: str,
+                         port: int,
+                         timeout: float = LOCALHOST_CONNECT_TIMEOUT) -> Optional[socket.socket]:
+    for family, sockaddr in localhost_socket_candidates(target, port):
+        sock: Optional[socket.socket] = None
+        try:
+            sock = socket.socket(family, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            sock.connect(sockaddr)
+            return sock
+        except OSError:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    return None
+
+
+def format_platform_os_guess() -> str:
+    parts = [
+        platform.system(),
+        platform.release(),
+        platform.version(),
+        platform.machine(),
+    ]
+    return " ".join(part for part in parts if part).strip()
+
+
+def localhost_service_name(port: int) -> str:
+    try:
+        return socket.getservbyport(port, "tcp")
+    except OSError:
+        return ""
+
+
+def parse_http_server_header(response_bytes: bytes) -> Tuple[str, str]:
+    text = response_bytes.decode("utf-8", errors="replace")
+    match = re.search(r"^Server:\s*(.+)$", text, flags=re.IGNORECASE | re.MULTILINE)
+    if not match:
+        return "", ""
+
+    server = match.group(1).strip()
+    product = server.split("/")[0].strip()
+    return product, server
+
+
+def read_socket_banner(sock: socket.socket) -> str:
+    sock.settimeout(LOCALHOST_READ_TIMEOUT)
+    try:
+        banner = sock.recv(512)
+    except OSError:
+        return ""
+    return banner.decode("utf-8", errors="replace").strip()
+
+
+def try_http_probe(target: str, port: int, use_ssl: bool = False) -> Optional[Dict[str, str]]:
+    sock = connect_to_localhost(target, port)
+    if sock is None:
+        return None
+
+    wrapped_sock: Optional[socket.socket] = sock
+    try:
+        if use_ssl:
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            wrapped_sock = context.wrap_socket(sock, server_hostname="localhost")
+
+        request = b"GET / HTTP/1.0\r\nHost: localhost\r\nUser-Agent: one-shot-enum\r\n\r\n"
+        wrapped_sock.settimeout(LOCALHOST_READ_TIMEOUT)
+        wrapped_sock.sendall(request)
+        response = wrapped_sock.recv(1024)
+        if not response.startswith(b"HTTP/"):
+            return None
+
+        product, server = parse_http_server_header(response)
+        return {
+            "service": "https" if use_ssl else "http",
+            "product": product,
+            "version": "",
+            "extrainfo": server,
+            "tunnel": "ssl" if use_ssl else "",
+            "banner": response.decode("utf-8", errors="replace").splitlines()[0].strip(),
+        }
+    except ssl.SSLError:
+        return None
+    except OSError:
+        return None
+    finally:
+        try:
+            if wrapped_sock is not None:
+                wrapped_sock.close()
+        except Exception:
+            pass
+
+
+def local_service_probe(target: str, port: int) -> Service:
+    entry: Service = {
+        "port": str(port),
+        "protocol": "tcp",
+        "service": localhost_service_name(port),
+        "product": "",
+        "version": "",
+        "extrainfo": "",
+        "tunnel": "",
+        "scripts": "",
+    }
+
+    http_result = try_http_probe(target, port, use_ssl=False)
+    if http_result is not None:
+        entry.update(http_result)
+        return entry
+
+    https_result = try_http_probe(target, port, use_ssl=True)
+    if https_result is not None:
+        entry.update(https_result)
+        return entry
+
+    sock = connect_to_localhost(target, port)
+    if sock is None:
+        return entry
+
+    try:
+        banner = read_socket_banner(sock)
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+    if banner:
+        entry["extrainfo"] = banner
+        if banner.startswith("SSH-"):
+            entry["service"] = "ssh"
+            entry["product"] = banner.split("-", 2)[-1]
+        elif "SMTP" in banner.upper():
+            entry["service"] = entry["service"] or "smtp"
+        elif "POP3" in banner.upper():
+            entry["service"] = entry["service"] or "pop3"
+        elif "IMAP" in banner.upper():
+            entry["service"] = entry["service"] or "imap"
+
+    return entry
+
+
+def is_http_like_service(service: Service) -> bool:
+    return service.get("service", "").lower() in {"http", "https"} or service.get("tunnel", "").lower() == "ssl"
 
 
 # =========================
@@ -862,9 +1043,12 @@ def enumerate_llm_service(target: str, service: Service, send_hello: bool = Fals
     return result
 
 
-def run_llm_enumeration(target: str, tcp_services: List[Service], send_hello: bool = False) -> None:
+def run_llm_enumeration(target: str,
+                        tcp_services: List[Service],
+                        send_hello: bool = False,
+                        probe_all_http: bool = False) -> None:
     for service in tcp_services:
-        if not resembles_llm_service(service):
+        if not resembles_llm_service(service) and not (probe_all_http and is_http_like_service(service)):
             continue
 
         port = service.get("port", "")
@@ -993,6 +1177,94 @@ def host_fingerprint_scan(target: str,
             "extra": extra,
             "nmap_output": output,
         }
+
+
+def localhost_fingerprint_scan(target: str, outdir: Optional[Path]) -> Dict:
+    hostname = socket.gethostname()
+    extra = {"os_guess": format_platform_os_guess()}
+    output = f"local-platform: {extra['os_guess']}"
+
+    if outdir:
+        write_text(outdir / "host_fingerprint.txt", output + "\n")
+
+    return {
+        "ip": "127.0.0.1" if target.strip().lower() != "::1" else "::1",
+        "hostname": hostname,
+        "extra": extra,
+        "nmap_output": output,
+    }
+
+
+def localhost_tcp_discovery_scan(target: str,
+                                 outdir: Optional[Path],
+                                 ports: Optional[List[int]] = None) -> Dict:
+    fingerprint = localhost_fingerprint_scan(target, outdir)
+    selected_ports = ports if ports else list(range(1, 65536))
+    open_ports: List[int] = []
+    completed = 0
+    last_render = 0.0
+    worker_count = min(LOCALHOST_SCAN_WORKERS, max(32, len(selected_ports)))
+
+    def check_port(port: int) -> Optional[int]:
+        sock = connect_to_localhost(target, port)
+        if sock is None:
+            return None
+        try:
+            return port
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_map = {executor.submit(check_port, port): port for port in selected_ports}
+        for future in as_completed(future_map):
+            completed += 1
+            port = future.result()
+            if port is not None:
+                open_ports.append(port)
+
+            now = time.time()
+            if now - last_render >= 0.2:
+                progress(
+                    f"DISCOVERY {target} | checked {completed}/{len(selected_ports)} ports | "
+                    f"open tcp ports found: {len(open_ports)}"
+                )
+                last_render = now
+
+    clear_progress_line()
+    open_ports.sort()
+    output = "\n".join(f"Discovered open port {port}/tcp on localhost" for port in open_ports)
+
+    if outdir:
+        write_text(outdir / "tcp_discovery.txt", output + ("\n" if output else ""))
+
+    return {
+        "target": target,
+        "ip": fingerprint.get("ip", "127.0.0.1"),
+        "hostname": fingerprint.get("hostname", ""),
+        "extra": fingerprint.get("extra", {}),
+        "open_ports": open_ports,
+        "nmap_output": output,
+    }
+
+
+def localhost_tcp_service_scan(target: str, ports: List[int], outdir: Optional[Path]) -> Dict:
+    services = [local_service_probe(target, port) for port in ports]
+    services = sorted(services, key=lambda service: int(service["port"]))
+    output_lines = [f"{svc['port']}/tcp {service_banner(svc)}" for svc in services]
+
+    if outdir:
+        write_text(outdir / "tcp_services.txt", "\n".join(output_lines) + ("\n" if output_lines else ""))
+
+    return {
+        "ip": "127.0.0.1" if target.strip().lower() != "::1" else "::1",
+        "hostname": socket.gethostname(),
+        "extra": {},
+        "services": services,
+        "nmap_output": "\n".join(output_lines),
+    }
 
 
 def tcp_discovery_scan(target: str,
@@ -1314,6 +1586,11 @@ def parse_args() -> argparse.Namespace:
         help="Create per-host folders and save XML/reports/CSV",
     )
     parser.add_argument(
+        "--no-color",
+        action="store_true",
+        help="Disable ANSI color in terminal output",
+    )
+    parser.add_argument(
         "--outdir",
         default="scan_results",
         help="Base output directory when --save is used (default: scan_results)",
@@ -1331,8 +1608,9 @@ def parse_args() -> argparse.Namespace:
 # =========================
 
 def main() -> None:
-    check_nmap_installed()
     args = parse_args()
+    if args.no_color:
+        set_color_mode(False)
     if args.hello:
         args.llm = True
 
@@ -1352,6 +1630,15 @@ def main() -> None:
         err("No valid targets supplied.")
         sys.exit(1)
 
+    has_nmap = nmap_installed()
+    use_local_fallback = not has_nmap and len(targets) == 1 and is_localhost_target(targets[0])
+
+    if not has_nmap and not use_local_fallback:
+        err("nmap not found in PATH. Install nmap, or run a localhost-only scan to use the built-in fallback.")
+        sys.exit(1)
+    if use_local_fallback:
+        warn("nmap not found in PATH. Using localhost-only Python fallback mode.")
+
     base_outdir: Optional[Path] = None
     target_dirs: Dict[str, Optional[Path]] = {target: None for target in targets}
 
@@ -1364,17 +1651,31 @@ def main() -> None:
             target_dirs[target] = host_dir
 
     good(f"Targets queued: {len(targets)}")
-    info(f"Stage-1 threads: {args.threads}")
-    info(f"Stage-1 timing: {args.timing}")
-    if selected_tcp_ports:
-        info("Host fingerprint: best effort OS detection on the selected TCP ports before -Pn fallback")
-        info(f"Stage-1 TCP port scope: {args.ports}")
+    info(f"Scan engine: {'python localhost fallback' if use_local_fallback else 'nmap'}")
+    if use_local_fallback:
+        info(f"Stage-1 threads: localhost worker pool up to {LOCALHOST_SCAN_WORKERS}")
+        info("Stage-1 timing: python fallback")
+        info("Host fingerprint: local platform fingerprint via Python standard library")
+        if selected_tcp_ports:
+            info(f"Stage-1 TCP port scope: {args.ports}")
+        else:
+            info("Stage-1 TCP port scope: full port range")
+        info("Service enum timing: python fallback")
     else:
-        info(f"Host fingerprint: best effort OS detection on top {HOST_FINGERPRINT_TOP_PORTS} ports before -Pn fallback")
-        info("Stage-1 TCP port scope: full port range")
-    info("Service enum timing: T3")
+        info(f"Stage-1 threads: {args.threads}")
+        info(f"Stage-1 timing: {args.timing}")
+        if selected_tcp_ports:
+            info("Host fingerprint: best effort OS detection on the selected TCP ports before -Pn fallback")
+            info(f"Stage-1 TCP port scope: {args.ports}")
+        else:
+            info(f"Host fingerprint: best effort OS detection on top {HOST_FINGERPRINT_TOP_PORTS} ports before -Pn fallback")
+            info("Stage-1 TCP port scope: full port range")
+        info("Service enum timing: T3")
     if args.udp:
-        info(f"UDP enabled: top {args.udp_top_ports} ports (timing: T3)")
+        if use_local_fallback:
+            warn("UDP requested, but UDP scanning requires nmap; skipping UDP in localhost fallback mode")
+        else:
+            info(f"UDP enabled: top {args.udp_top_ports} ports (timing: T3)")
     if args.llm:
         info("LLM/API enum enabled for matching services")
     if args.hello:
@@ -1391,16 +1692,27 @@ def main() -> None:
     stage1_results: Dict[str, Dict] = {}
 
     with ThreadPoolExecutor(max_workers=args.threads) as executor:
-        future_map = {
-            executor.submit(
-                tcp_discovery_scan,
-                target,
-                target_dirs[target],
-                args.timing,
-                selected_tcp_ports or None,
-            ): target
-            for target in targets
-        }
+        if use_local_fallback:
+            future_map = {
+                executor.submit(
+                    localhost_tcp_discovery_scan,
+                    target,
+                    target_dirs[target],
+                    selected_tcp_ports or None,
+                ): target
+                for target in targets
+            }
+        else:
+            future_map = {
+                executor.submit(
+                    tcp_discovery_scan,
+                    target,
+                    target_dirs[target],
+                    args.timing,
+                    selected_tcp_ports or None,
+                ): target
+                for target in targets
+            }
 
         for future in as_completed(future_map):
             target = future_map[future]
@@ -1444,14 +1756,23 @@ def main() -> None:
 
         if tcp_open_ports:
             try:
-                tcp_result = tcp_service_scan(target, tcp_open_ports, host_dir)
+                tcp_result = (
+                    localhost_tcp_service_scan(target, tcp_open_ports, host_dir)
+                    if use_local_fallback
+                    else tcp_service_scan(target, tcp_open_ports, host_dir)
+                )
                 ip_addr = tcp_result.get("ip", ip_addr)
                 hostname = tcp_result.get("hostname", hostname)
                 extra = merge_extra_info(extra, tcp_result.get("extra", {}))
                 tcp_services = tcp_result.get("services", [])
                 if args.llm:
                     try:
-                        run_llm_enumeration(target, tcp_services, send_hello=args.hello)
+                        run_llm_enumeration(
+                            target,
+                            tcp_services,
+                            send_hello=args.hello,
+                            probe_all_http=use_local_fallback,
+                        )
                     except Exception as exc:
                         err(f"{target}: LLM/API enum failed: {exc}")
             except Exception as exc:
@@ -1459,7 +1780,7 @@ def main() -> None:
         else:
             warn(f"{target}: skipping TCP service scan because no TCP ports were discovered")
 
-        if args.udp:
+        if args.udp and not use_local_fallback:
             try:
                 info(f"{target}: running UDP top-ports scan")
                 udp_result = udp_scan(target, args.udp_top_ports, host_dir)
