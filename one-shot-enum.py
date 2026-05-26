@@ -10,6 +10,7 @@ Features:
     - CIDRs:              10.10.10.0/24
     - short ranges:       10.10.10.10-20
     - full ranges:        10.10.10.10-10.10.10.30
+    - localhost:          localhost
 - Stage 1:
     - Fast TCP full-port discovery scan (-Pn -T<1-5> -p- --open)
     - Optional TCP targeted discovery on user-specified ports/ranges via --ports
@@ -116,10 +117,11 @@ def clear_progress_line() -> None:
 # Helpers
 # =========================
 
-OPEN_PORT_RE = re.compile(r"Discovered open port (\d+)/(tcp|udp) on ([0-9.]+)")
+OPEN_PORT_RE = re.compile(r"Discovered open port (\d+)/(tcp|udp) on (\S+)")
 STATS_RE = re.compile(r"Stats:\s*(.*)")
 PERCENT_RE = re.compile(r"About\s+([0-9.]+)%\s+done", re.IGNORECASE)
 HOST_FINGERPRINT_TOP_PORTS = 20
+LOCALHOST_TARGETS = {"localhost", "127.0.0.1", "::1"}
 
 
 def check_nmap_installed() -> None:
@@ -140,8 +142,37 @@ def int_to_ip(value: int) -> str:
     return str(ipaddress.IPv4Address(value))
 
 
+def is_localhost_target(value: str) -> bool:
+    return value.strip().lower() in LOCALHOST_TARGETS
+
+
+def target_sort_key(target: str) -> Tuple[int, int, str]:
+    try:
+        return (0, ip_to_int(target), target)
+    except ValueError:
+        if is_localhost_target(target):
+            return (1, 0, target.lower())
+        return (2, 0, target.lower())
+
+
+def target_matches(found_target: str, requested_target: str) -> bool:
+    found = found_target.strip().lower()
+    requested = requested_target.strip().lower()
+
+    if found == requested:
+        return True
+
+    if is_localhost_target(requested):
+        return found in LOCALHOST_TARGETS
+
+    return False
+
+
 def expand_target(target: str) -> List[str]:
     target = target.strip()
+
+    if is_localhost_target(target):
+        return ["localhost"]
 
     if "/" in target:
         try:
@@ -192,7 +223,7 @@ def normalize_targets(raw_targets: List[str]) -> List[str]:
     for raw in raw_targets:
         for ip in expand_target(raw):
             expanded.add(ip)
-    return sorted(expanded, key=ip_to_int)
+    return sorted(expanded, key=target_sort_key)
 
 
 def parse_port_spec(port_spec: str) -> List[int]:
@@ -310,7 +341,7 @@ def run_nmap_with_progress(cmd: List[str], target: str, phase: str, proto: str =
             port = int(m_open.group(1))
             found_proto = m_open.group(2)
             found_target = m_open.group(3)
-            if found_target == target and found_proto == proto:
+            if target_matches(found_target, target) and found_proto == proto:
                 discovered_ports.add(port)
 
         m_stats = STATS_RE.search(line)
@@ -344,10 +375,16 @@ def get_host_identifier(host_el: ET.Element) -> Tuple[str, str]:
     ip_addr = "unknown"
     hostname = ""
 
+    fallback_addr = ""
     for addr in host_el.findall("address"):
+        if not fallback_addr:
+            fallback_addr = addr.attrib.get("addr", "unknown")
         if addr.attrib.get("addrtype") == "ipv4":
             ip_addr = addr.attrib.get("addr", "unknown")
             break
+
+    if ip_addr == "unknown" and fallback_addr:
+        ip_addr = fallback_addr
 
     hostnames = host_el.find("hostnames")
     if hostnames is not None:
@@ -1232,7 +1269,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "targets",
         nargs="+",
-        help="IPs, CIDRs, or ranges",
+        help="IPs, CIDRs, ranges, or localhost",
     )
     parser.add_argument(
         "--threads",
@@ -1281,7 +1318,12 @@ def parse_args() -> argparse.Namespace:
         default="scan_results",
         help="Base output directory when --save is used (default: scan_results)",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if any(is_localhost_target(target) for target in args.targets):
+        normalized = {target.strip().lower() for target in args.targets}
+        if len(normalized) > 1:
+            parser.error("When using localhost, run it by itself as the target.")
+    return args
 
 
 # =========================
