@@ -21,7 +21,8 @@ Features:
 - Optional UDP:
     - UDP top-ports scan (-Pn -T3 -sU --top-ports N)
 - Optional LLM/API enum:
-    - With --llm, detect LLM/API-like services, list OpenAPI paths, and probe useful config endpoints
+    - With --llm-endpoint, detect LLM/API-like services and list OpenAPI endpoints
+    - With --llm-full, also probe useful config/model/chat paths
     - With --hello, send a test prompt to /chat when discovered
 - Local fallback:
     - If nmap is missing, localhost scans fall back to pure-Python TCP/service checks
@@ -975,13 +976,17 @@ def apply_openapi_response(result: Dict[str, Any], response: Dict[str, Any], url
         result["openapi_error"] = "Response was not valid JSON"
 
 
-def enumerate_llm_service(target: str, service: Service, send_hello: bool = False) -> Dict[str, Any]:
+def enumerate_llm_service(target: str,
+                          service: Service,
+                          send_hello: bool = False,
+                          endpoint_only: bool = False) -> Dict[str, Any]:
     base_url = service_base_url(target, service)
     openapi_url = f"{base_url}{OPENAPI_CANDIDATE_PATHS[0]}"
     openapi_response = http_request(openapi_url)
 
     result: Dict[str, Any] = {
         "base_url": base_url,
+        "endpoint_only": endpoint_only,
         "openapi_url": "",
         "openapi_status": None,
         "openapi_error": "",
@@ -1004,6 +1009,9 @@ def enumerate_llm_service(target: str, service: Service, send_hello: bool = Fals
             if candidate_endpoints:
                 apply_openapi_response(result, candidate_response, candidate_url)
                 break
+
+    if endpoint_only:
+        return result
 
     result["probe_hits"] = probe_llm_paths(base_url)
 
@@ -1046,18 +1054,26 @@ def enumerate_llm_service(target: str, service: Service, send_hello: bool = Fals
 def run_llm_enumeration(target: str,
                         tcp_services: List[Service],
                         send_hello: bool = False,
+                        endpoint_only: bool = False,
                         probe_all_http: bool = False) -> None:
     for service in tcp_services:
         if not resembles_llm_service(service) and not (probe_all_http and is_http_like_service(service)):
             continue
 
         port = service.get("port", "")
-        info(f"{target}:{port}: LLM/API-like service found; probing endpoints")
-        service["llm_enum"] = enumerate_llm_service(target, service, send_hello=send_hello)
+        action = "checking OpenAPI endpoints" if endpoint_only else "probing endpoints and common paths"
+        info(f"{target}:{port}: LLM/API-like service found; {action}")
+        service["llm_enum"] = enumerate_llm_service(
+            target,
+            service,
+            send_hello=send_hello,
+            endpoint_only=endpoint_only,
+        )
 
 
 def llm_enum_lines(llm_enum: Dict[str, Any]) -> List[str]:
-    lines: List[str] = ["LLM/API enum:"]
+    endpoint_only = bool(llm_enum.get("endpoint_only"))
+    lines: List[str] = ["LLM/API endpoint enum:" if endpoint_only else "LLM/API enum:"]
     status = llm_enum.get("openapi_status")
     status_text = f"status {status}" if status is not None else "no status"
 
@@ -1073,6 +1089,9 @@ def llm_enum_lines(llm_enum: Dict[str, Any]) -> List[str]:
             lines.append(f"    {endpoint['method']:<6} {endpoint['path']}")
     else:
         lines.append("  Endpoints: none found")
+
+    if endpoint_only:
+        return lines
 
     probe_hits = llm_enum.get("probe_hits", [])
     probe_count = llm_enum.get("probe_count", len(LLM_PROBE_PATHS))
@@ -1565,14 +1584,19 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated TCP ports and ranges to scan instead of a full-port discovery pass (example: 80,443,8000-8010)",
     )
     parser.add_argument(
-        "--llm",
+        "--llm-endpoint",
         action="store_true",
-        help="For LLM/API-like services, enumerate OpenAPI and probe config paths",
+        help="For LLM/API-like services, list discovered OpenAPI endpoints only",
+    )
+    parser.add_argument(
+        "--llm-full",
+        action="store_true",
+        help="For LLM/API-like services, enumerate OpenAPI and probe config/model/chat paths",
     )
     parser.add_argument(
         "--hello",
         action="store_true",
-        help="Send a test prompt to /chat when discovered during LLM/API enum",
+        help="Send a test prompt to /chat when discovered during --llm-full enum",
     )
     parser.add_argument(
         "--timing",
@@ -1596,6 +1620,10 @@ def parse_args() -> argparse.Namespace:
         help="Base output directory when --save is used (default: scan_results)",
     )
     args = parser.parse_args()
+    if args.llm_endpoint and args.llm_full:
+        parser.error("Use either --llm-endpoint or --llm-full, not both.")
+    if args.llm_endpoint and args.hello:
+        parser.error("--hello requires --llm-full and cannot be used with --llm-endpoint.")
     if any(is_localhost_target(target) for target in args.targets):
         normalized = {target.strip().lower() for target in args.targets}
         if len(normalized) > 1:
@@ -1612,7 +1640,7 @@ def main() -> None:
     if args.no_color:
         set_color_mode(False)
     if args.hello:
-        args.llm = True
+        args.llm_full = True
 
     try:
         targets = normalize_targets(args.targets)
@@ -1676,8 +1704,10 @@ def main() -> None:
             warn("UDP requested, but UDP scanning requires nmap; skipping UDP in localhost fallback mode")
         else:
             info(f"UDP enabled: top {args.udp_top_ports} ports (timing: T3)")
-    if args.llm:
-        info("LLM/API enum enabled for matching services")
+    if args.llm_endpoint:
+        info("LLM/API endpoint enum enabled for matching services")
+    if args.llm_full:
+        info("LLM/API full enum enabled for matching services")
     if args.hello:
         info("Hello prompt enabled for discovered /chat endpoints")
     info(f"Save output: {'yes' if args.save else 'no'}")
@@ -1765,12 +1795,13 @@ def main() -> None:
                 hostname = tcp_result.get("hostname", hostname)
                 extra = merge_extra_info(extra, tcp_result.get("extra", {}))
                 tcp_services = tcp_result.get("services", [])
-                if args.llm:
+                if args.llm_endpoint or args.llm_full:
                     try:
                         run_llm_enumeration(
                             target,
                             tcp_services,
                             send_hello=args.hello,
+                            endpoint_only=args.llm_endpoint,
                             probe_all_http=use_local_fallback,
                         )
                     except Exception as exc:
