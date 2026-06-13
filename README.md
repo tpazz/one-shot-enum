@@ -64,6 +64,72 @@ Saved output includes:
 - Per-host `summary.txt`
 - Top-level `services_summary.csv`
 
+## PathFinder integration
+
+[PathFinder](../PathFinder) is an attack-path analysis tool that consumes the
+output of common enumeration tools. one-shot-enum can turn its discovered
+services into the right follow-up commands for it, in two modes — pick one.
+
+### `--suggest`
+
+Prints the next-step enumeration commands for each discovered service (gobuster,
+ffuf, nikto, whatweb, nuclei, wpscan, enum4linux-ng, smbmap, netexec,
+snmp-check, kerbrute, GetNPUsers, and more), with output flags that PathFinder's
+`scan` auto-detector understands, and writes a runnable `pathfinder_recon.sh`
+(plus `pathfinder_recon.ps1` for Windows post-foothold steps).
+
+```bash
+python one-shot-enum.py 10.10.10.10 --suggest
+```
+
+In the generated script:
+
+- Live (uncommented) lines are unauthenticated recon you can run immediately.
+- Commands that need credentials or a foothold (LDAP dumps, Kerberoasting,
+  certipy, secretsdump, linpeas/winpeas, SharpHound) are commented-out with
+  `<domain>`/`<user>`/`<pass>` placeholders to edit.
+- Tools whose PathFinder parser is still on the roadmap are tagged
+  `parser pending`.
+
+Then run the script and hand the loot to PathFinder:
+
+```bash
+bash pathfinder_recon.sh
+python3 -m main.pathfinder scan loot/
+```
+
+### `--run`
+
+Runs the whole pipeline for you: executes the unauthenticated recon commands
+into `loot/`, then invokes PathFinder on the results. **Skips any tool that
+isn't installed** and any command whose wordlist is missing; credentialed and
+post-foothold commands are never executed. Intended for the Kali/attack host
+(PathFinder is located in a sibling `../PathFinder` directory).
+
+```bash
+python one-shot-enum.py 10.10.10.10 --run
+python one-shot-enum.py 10.10.10.10 --run --run-threads 8   # more concurrency
+```
+
+Tools run **concurrently** in a bounded worker pool (`--run-threads`, default 4).
+Because their output can't be sensibly interleaved, the terminal shows a live
+status table — one row per tool with its state, elapsed time, and latest
+progress line:
+
+```
+Recon [4 workers]: 3 running, 2 done, 1 skipped, 0 other
+  gobuster    10.10.10.10   running   00:42  | Progress: 4120 / 87664
+  ffuf        10.10.10.10   running   00:42  | :: 38200/220560 :: 900 req/s
+  nuclei      10.10.10.10   running   00:41  | [info] templates 1200/5000
+  whatweb     10.10.10.10   done      00:03
+  nikto       10.10.10.10   done      00:38
+  smbmap      10.10.10.10   skip (no tool)   --:--
+```
+
+Each tool's full output is captured to `loot/_logs/<tool>_<host>.log` so nothing
+is lost and failures stay diagnosable. Lower `--run-threads 1` to go easy on a
+single target; raise it for multi-host sweeps.
+
 ## Requirements
 
 - Python 3

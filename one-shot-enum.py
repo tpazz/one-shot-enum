@@ -1550,6 +1550,508 @@ def write_csv_summary(csv_path: Path, rows: List[Dict[str, str]]) -> None:
 
 
 # =========================
+# PathFinder bridge: next-step suggestions
+# =========================
+#
+# Given the services discovered in stage 2, suggest the follow-up enumeration
+# tools PathFinder has (or will have) parsers for, with example commands that
+# write output in a format PathFinder's `scan` auto-detector can consume.
+#
+# Workflow:
+#   one-shot-enum <target> --suggest   ->   run commands into the loot dir
+#                                       ->   pathfinder scan <loot>/
+
+LOOT_DIR = "loot"
+DEFAULT_WEB_WORDLIST = "/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt"
+DEFAULT_USER_WORDLIST = "/usr/share/seclists/Usernames/top-usernames-shortlist.txt"
+PATHFINDER_SCAN_CMD = "python3 -m main.pathfinder scan"
+
+WEB_PORTS = {80, 443, 591, 3000, 5000, 8000, 8008, 8080, 8081, 8088, 8180,
+             8443, 8444, 8800, 8888, 9000, 9090, 9443}
+WEB_HTTPS_PORTS = {443, 8443, 8444, 9443, 2083, 2087, 2096}
+SMB_PORTS = {139, 445}
+LDAP_PORTS = {389, 636, 3268, 3269}
+KERBEROS_PORTS = {88}
+SNMP_PORTS = {161}
+
+DOMAIN_PLACEHOLDER = "<domain>"
+USER_PLACEHOLDER = "<user>"
+PASS_PLACEHOLDER = "<pass>"
+
+
+def _suggestion(host: str, group: str, tool: str, command: str, parser: str,
+                pending: bool = False, gated: bool = False, shell: str = "bash",
+                note: str = "") -> Dict[str, Any]:
+    return {
+        "host": host, "group": group, "tool": tool, "command": command,
+        "parser": parser, "pending": pending, "gated": gated, "shell": shell,
+        "note": note,
+    }
+
+
+def _svc_port(service: Service) -> int:
+    try:
+        return int(str(service.get("port", "0")))
+    except ValueError:
+        return 0
+
+
+def _svc_name(service: Service) -> str:
+    return service.get("service", "").lower()
+
+
+def _is_web_service(service: Service) -> bool:
+    return "http" in _svc_name(service) or _svc_port(service) in WEB_PORTS
+
+
+def _web_scheme(service: Service) -> str:
+    if ("https" in _svc_name(service)
+            or service.get("tunnel", "").lower() == "ssl"
+            or _svc_port(service) in WEB_HTTPS_PORTS):
+        return "https"
+    return "http"
+
+
+def _looks_wordpress(service: Service) -> bool:
+    blob = " ".join([
+        service.get("product", ""), service.get("extrainfo", ""),
+        service.get("scripts", ""),
+    ]).lower()
+    return "wordpress" in blob or "wp-content" in blob
+
+
+def _web_suggestions(host: str, service: Service, loot: str, wordlist: str) -> List[Dict[str, Any]]:
+    scheme = _web_scheme(service)
+    port = _svc_port(service)
+    base = f"{scheme}://{host}:{port}"
+    group = f"web {scheme}:{port}"
+    k = " -k" if scheme == "https" else ""
+    out = [
+        _suggestion(host, group, "whatweb",
+                    f"whatweb -a3 {base} --log-json={loot}/whatweb_{port}.json", "whatweb_json"),
+        _suggestion(host, group, "gobuster",
+                    f"gobuster dir -u {base} -w {wordlist}{k} -o {loot}/gobuster_{port}.txt", "gobuster_txt"),
+        _suggestion(host, group, "ffuf",
+                    f"ffuf -u {base}/FUZZ -w {wordlist}{k} -of json -o {loot}/ffuf_{port}.json",
+                    "ffuf_json"),
+        _suggestion(host, group, "nikto",
+                    f"nikto -h {base} -Format json -o {loot}/nikto_{port}.json", "nikto_json"),
+        _suggestion(host, group, "nuclei",
+                    f"nuclei -u {base} -jsonl -o {loot}/nuclei_{port}.jsonl", "nuclei_jsonl"),
+    ]
+    if _looks_wordpress(service):
+        out.append(_suggestion(host, group, "wpscan",
+                   f"wpscan --url {base} --format json -o {loot}/wpscan_{port}.json --disable-tls-checks",
+                   "wpscan_json"))
+    return out
+
+
+def _smb_suggestions(host: str, loot: str) -> List[Dict[str, Any]]:
+    tag = safe_name(host)
+    return [
+        _suggestion(host, "smb", "enum4linux-ng",
+                    f"enum4linux-ng -A -oJ {loot}/enum4linux_{tag} {host}", "enum4linux_json"),
+        _suggestion(host, "smb", "smbmap",
+                    f"smbmap -H {host} -u guest -p '' > {loot}/smbmap_{tag}.txt", "smbmap_txt"),
+        _suggestion(host, "smb", "netexec",
+                    f"nxc smb {host} --shares --users --log {loot}/nxc_{tag}.log",
+                    "netexec_log"),
+    ]
+
+
+def _snmp_suggestions(host: str, loot: str) -> List[Dict[str, Any]]:
+    return [
+        _suggestion(host, "snmp", "snmp-check",
+                    f"snmp-check {host} -c public > {loot}/snmp_{safe_name(host)}.txt", "snmp_txt"),
+    ]
+
+
+def _ad_suggestions(host: str, loot: str, userlist: str) -> List[Dict[str, Any]]:
+    dom, user, pw = DOMAIN_PLACEHOLDER, USER_PLACEHOLDER, PASS_PLACEHOLDER
+    return [
+        _suggestion(host, "ad kerberos", "kerbrute",
+                    f"kerbrute userenum -d {dom} --dc {host} {userlist} -o {loot}/kerbrute.txt",
+                    "kerbrute_txt"),
+        _suggestion(host, "ad kerberos", "impacket-GetNPUsers",
+                    f"impacket-GetNPUsers {dom}/ -dc-ip {host} -usersfile {userlist} "
+                    f"-format hashcat -outputfile {loot}/getnpusers.txt", "getnpusers_hashes"),
+        _suggestion(host, "ad (needs creds)", "ldapdomaindump",
+                    f"ldapdomaindump -u '{dom}\\{user}' -p '{pw}' {host} -o {loot}/ldap/",
+                    "ldapdomaindump_dir", gated=True),
+        _suggestion(host, "ad (needs creds)", "impacket-GetUserSPNs",
+                    f"impacket-GetUserSPNs {dom}/{user}:{pw} -dc-ip {host} -request "
+                    f"-outputfile {loot}/getuserspns.txt", "getuserspns_hashes", gated=True),
+        _suggestion(host, "ad (needs creds)", "certipy",
+                    f"certipy find -u {user}@{dom} -p '{pw}' -dc-ip {host} -json -output {loot}/certipy",
+                    "certipy_json", gated=True),
+        _suggestion(host, "ad (needs creds)", "impacket-secretsdump",
+                    f"impacket-secretsdump {dom}/{user}:{pw}@{host} | tee {loot}/secretsdump.txt",
+                    "secretsdump_txt", gated=True),
+    ]
+
+
+def _post_foothold_suggestions(host: str, loot: str) -> List[Dict[str, Any]]:
+    tag = safe_name(host)
+    return [
+        _suggestion(host, "post-foothold (linux)", "linpeas",
+                    f"./linpeas.sh | tee {loot}/linpeas_{tag}.txt", "linpeas_txt", gated=True),
+        _suggestion(host, "post-foothold (windows)", "winpeas",
+                    f".\\winPEASany.exe > {loot}\\winpeas_{tag}.txt", "winpeas_txt",
+                    gated=True, shell="powershell"),
+        _suggestion(host, "post-foothold (windows)", "SharpHound",
+                    f".\\SharpHound.exe -c All --outputdirectory {loot}\\sharphound_{tag}",
+                    "sharphound_dir", gated=True, shell="powershell",
+                    note="unzip the resulting .zip into that folder before scanning"),
+    ]
+
+
+def suggest_for_host(host: str,
+                     tcp_services: List[Service],
+                     udp_services: List[Service],
+                     loot: str,
+                     wordlist: str,
+                     userlist: str) -> List[Dict[str, Any]]:
+    suggestions: List[Dict[str, Any]] = []
+    has_smb = False
+    has_ad = False
+    has_snmp = False
+
+    for service in tcp_services:
+        port = _svc_port(service)
+        if _is_web_service(service):
+            suggestions.extend(_web_suggestions(host, service, loot, wordlist))
+        if _svc_name(service) in {"microsoft-ds", "netbios-ssn", "smb"} or port in SMB_PORTS:
+            has_smb = True
+        if "ldap" in _svc_name(service) or "kerberos" in _svc_name(service) \
+                or port in LDAP_PORTS or port in KERBEROS_PORTS:
+            has_ad = True
+
+    for service in list(udp_services) + list(tcp_services):
+        if "snmp" in _svc_name(service) or _svc_port(service) in SNMP_PORTS:
+            has_snmp = True
+
+    if has_smb:
+        suggestions.extend(_smb_suggestions(host, loot))
+    if has_snmp:
+        suggestions.extend(_snmp_suggestions(host, loot))
+    if has_ad:
+        suggestions.extend(_ad_suggestions(host, loot, userlist))
+    suggestions.extend(_post_foothold_suggestions(host, loot))
+
+    seen: Set[Tuple[str, str, str]] = set()
+    deduped: List[Dict[str, Any]] = []
+    for s in suggestions:
+        key = (s["host"], s["tool"], s["command"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(s)
+    return deduped
+
+
+def _ordered_groups(suggestions: List[Dict[str, Any]]) -> List[str]:
+    groups: List[str] = []
+    for s in suggestions:
+        if s["group"] not in groups:
+            groups.append(s["group"])
+    return groups
+
+
+def print_suggestions(host: str, suggestions: List[Dict[str, Any]]) -> None:
+    if not suggestions:
+        info(f"{host}: no PathFinder-relevant services found to suggest tooling for")
+        return
+
+    print(color(f"PathFinder next steps for {host}", C.BOLD))
+    for group in _ordered_groups(suggestions):
+        print(color(f"  {group}", C.CYAN))
+        for s in [x for x in suggestions if x["group"] == group]:
+            tags = []
+            if s["pending"]:
+                tags.append("parser pending")
+            if s["gated"]:
+                tags.append("needs creds/foothold")
+            tag_text = color("  [" + ", ".join(tags) + "]", C.GREY) if tags else ""
+            print(f"    {s['command']}{tag_text}")
+            meta = f"-> {s['parser']}"
+            if s["note"]:
+                meta += f"; {s['note']}"
+            print(color(f"      {meta}", C.GREY))
+    print()
+
+
+def _script_line(s: Dict[str, Any]) -> str:
+    notes = [f"-> {s['parser']}"]
+    if s["pending"]:
+        notes.append("parser pending")
+    if s["gated"]:
+        notes.append("needs creds/foothold")
+    if s["note"]:
+        notes.append(s["note"])
+    line = f"{s['command']}   # {'; '.join(notes)}"
+    # Gated commands (need creds or a foothold) are emitted commented-out so the
+    # script never runs anything unattended that depends on placeholders.
+    return f"# {line}" if s["gated"] else line
+
+
+def write_recon_scripts(outdir: Path,
+                        all_suggestions: List[Dict[str, Any]],
+                        loot: str) -> List[Path]:
+    hosts: List[str] = []
+    for s in all_suggestions:
+        if s["host"] not in hosts:
+            hosts.append(s["host"])
+
+    bash_lines = [
+        "#!/usr/bin/env bash",
+        "# Generated by one-shot-enum --suggest. Review before running.",
+        "# Live lines are unauthenticated recon; commented lines need creds/a foothold.",
+        "set -u",
+        f"mkdir -p {loot} {loot}/ldap",
+        "",
+    ]
+    ps_lines = [
+        "# Generated by one-shot-enum --suggest. Run these on the target after a foothold.",
+        "# All commands are commented out; uncomment and edit placeholders as needed.",
+        "",
+    ]
+    has_ps = False
+
+    for host in hosts:
+        host_suggestions = [s for s in all_suggestions if s["host"] == host]
+        bash_for_host = [s for s in host_suggestions if s["shell"] == "bash"]
+        ps_for_host = [s for s in host_suggestions if s["shell"] == "powershell"]
+
+        if bash_for_host:
+            bash_lines.append(f"# ===== {host} =====")
+            for group in _ordered_groups(bash_for_host):
+                bash_lines.append(f"# --- {group} ---")
+                for s in [x for x in bash_for_host if x["group"] == group]:
+                    bash_lines.append(_script_line(s))
+            bash_lines.append("")
+
+        if ps_for_host:
+            has_ps = True
+            ps_lines.append(f"# ===== {host} =====")
+            for s in ps_for_host:
+                ps_lines.append(_script_line(s))
+            ps_lines.append("")
+
+    bash_lines.append(f"# When collection is done: {PATHFINDER_SCAN_CMD} {loot}/")
+    ps_lines.append(f"# After transferring loot back: {PATHFINDER_SCAN_CMD} {loot}/")
+
+    written: List[Path] = []
+    bash_path = outdir / "pathfinder_recon.sh"
+    write_text(bash_path, "\n".join(bash_lines) + "\n")
+    written.append(bash_path)
+    if has_ps:
+        ps_path = outdir / "pathfinder_recon.ps1"
+        write_text(ps_path, "\n".join(ps_lines) + "\n")
+        written.append(ps_path)
+    return written
+
+
+def _ordered_hosts(suggestions: List[Dict[str, Any]]) -> List[str]:
+    hosts: List[str] = []
+    for s in suggestions:
+        if s["host"] not in hosts:
+            hosts.append(s["host"])
+    return hosts
+
+
+def runnable_suggestions(all_suggestions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Live, unauthenticated, kali-side commands only (never gated/placeholder ones)."""
+    return [s for s in all_suggestions if not s["gated"] and s["shell"] == "bash"]
+
+
+def _print_run_plan(live: List[Dict[str, Any]]) -> None:
+    print(color(f"\nPlan: {len(live)} unauthenticated recon command(s)", C.BOLD))
+    for host in _ordered_hosts(live):
+        print(color(f"  {host}", C.CYAN))
+        for s in [x for x in live if x["host"] == host]:
+            print(f"    {s['tool']:<16} {s['command']}")
+
+
+def _fmt_elapsed(seconds: float) -> str:
+    total = int(seconds)
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+class _LiveTable:
+    """Minimal in-place multi-line renderer for a refreshing status table (TTY only)."""
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+        self.prev_lines = 0
+
+    def render(self, lines: List[str]) -> None:
+        if not self.enabled:
+            return
+        buf = ""
+        if self.prev_lines:
+            buf += f"\033[{self.prev_lines}A"  # cursor up to the top of the previous table
+        for line in lines:
+            buf += "\033[2K" + line + "\n"      # clear line, then redraw
+        sys.stdout.write(buf)
+        sys.stdout.flush()
+        self.prev_lines = len(lines)
+
+
+def _run_worker(job: Dict[str, Any], lock: threading.Lock, tty: bool) -> None:
+    job["state"] = "running"
+    job["start"] = time.time()
+    try:
+        with open(job["logpath"], "w", encoding="utf-8", errors="replace") as logf:
+            # shell=True so redirections (snmp-check > file) and quoting work.
+            # text mode uses universal newlines, so carriage-return progress lines
+            # from gobuster/ffuf arrive as discrete lines we can tail.
+            proc = subprocess.Popen(
+                job["command"], shell=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, errors="replace",
+            )
+            for line in proc.stdout:
+                logf.write(line)
+                stripped = line.strip()
+                if stripped:
+                    with lock:
+                        job["last"] = stripped[:70]
+            proc.wait()
+            job["rc"] = proc.returncode
+    except Exception as exc:
+        job["rc"] = -1
+        job["error"] = str(exc)
+    job["end"] = time.time()
+
+    rc = job.get("rc")
+    if job.get("error"):
+        job["state"] = "failed"
+    elif rc == 0:
+        job["state"] = "done"
+    else:
+        job["state"] = f"exit {rc}"
+
+    if not tty:
+        elapsed = _fmt_elapsed(job["end"] - job["start"])
+        if job["state"] == "failed":
+            err(f"[fail] {job['tool']} ({job['host']}): {job.get('error')}")
+        else:
+            good(f"[{job['state']}] {job['tool']} ({job['host']}) in {elapsed}")
+
+
+def run_suggestions(all_suggestions: List[Dict[str, Any]],
+                    loot: str,
+                    wordlist: str,
+                    userlist: str,
+                    threads: int = 4) -> Optional[Dict[str, int]]:
+    """Execute the live recon commands concurrently, with a live per-tool status table.
+
+    Missing tools and missing wordlists are skipped before launch. Each tool's
+    combined output is captured to a per-tool log under <loot>/_logs/.
+    """
+    live = runnable_suggestions(all_suggestions)
+    if not live:
+        warn("No runnable (unauthenticated) commands to execute.")
+        return None
+
+    _print_run_plan(live)
+
+    loot_path = Path(loot)
+    (loot_path / "ldap").mkdir(parents=True, exist_ok=True)
+    logs_dir = loot_path / "_logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build job records and pre-skip missing tools / wordlists before launch.
+    jobs: List[Dict[str, Any]] = []
+    for idx, s in enumerate(live):
+        binary = s["command"].split()[0]
+        job: Dict[str, Any] = {
+            "tool": s["tool"], "host": s["host"], "command": s["command"],
+            "state": "queued", "last": "", "rc": None, "start": None, "end": None,
+            "error": "",
+            "logpath": str(logs_dir / f"{safe_name(s['tool'])}_{safe_name(s['host'])}_{idx}.log"),
+        }
+        if shutil.which(binary) is None:
+            job["state"] = "skip:no-tool"
+        else:
+            missing_dep = next(
+                (dep for dep in (wordlist, userlist)
+                 if dep and dep in s["command"] and not os.path.exists(dep)),
+                None,
+            )
+            if missing_dep:
+                job["state"] = "skip:no-wordlist"
+        jobs.append(job)
+
+    to_run = [j for j in jobs if not j["state"].startswith("skip")]
+    threads = max(1, threads)
+    tty = sys.stdout.isatty()
+    renderer = _LiveTable(enabled=tty)
+    lock = threading.Lock()
+
+    def build_lines() -> List[str]:
+        now = time.time()
+        running = sum(1 for j in jobs if j["state"] == "running")
+        done = sum(1 for j in jobs if j["state"] == "done")
+        skipped = sum(1 for j in jobs if j["state"].startswith("skip"))
+        other = sum(1 for j in jobs if j["state"] == "failed" or j["state"].startswith("exit"))
+        header = (f"Recon [{threads} workers]: {running} running, {done} done, "
+                  f"{skipped} skipped, {other} other")
+        lines = [color(header, C.BOLD)]
+        for j in jobs:
+            state = j["state"]
+            disp = {"skip:no-tool": "skip (no tool)", "skip:no-wordlist": "skip (no wl)"}.get(state, state)
+            elapsed = _fmt_elapsed((j["end"] or now) - j["start"]) if j["start"] else "--:--"
+            row = f"  {j['tool']:<16}{j['host']:<16}{disp:<16}{elapsed}"
+            if state == "running" and j["last"]:
+                row += f"  | {j['last']}"
+            lines.append(row)
+        return lines
+
+    print()
+    if not tty:
+        info(f"Running {len(to_run)} command(s) with up to {threads} workers; output -> {logs_dir}")
+        for j in jobs:
+            if j["state"].startswith("skip"):
+                warn(f"[skip] {j['tool']} ({j['host']}): {j['state'].split(':', 1)[1]}")
+
+    with ThreadPoolExecutor(max_workers=threads) as executor:
+        for j in to_run:
+            executor.submit(_run_worker, j, lock, tty)
+        renderer.render(build_lines())
+        while any(j["state"] in ("queued", "running") for j in to_run):
+            renderer.render(build_lines())
+            time.sleep(0.3)
+        renderer.render(build_lines())
+
+    ran = sum(1 for j in jobs if j["state"] == "done")
+    skipped = sum(1 for j in jobs if j["state"].startswith("skip"))
+    nonzero = sum(1 for j in jobs if j["state"].startswith("exit"))
+    failed = sum(1 for j in jobs if j["state"] == "failed")
+
+    print()
+    good(f"Recon complete: {ran} ran clean, {skipped} skipped, {nonzero} non-zero exit, {failed} failed")
+    good(f"Per-tool logs: {logs_dir}")
+    return {"ran": ran, "skipped": skipped, "nonzero": nonzero, "failed": failed}
+
+
+def run_pathfinder(pathfinder_path: str, loot: str) -> None:
+    """Invoke PathFinder's scan mode on the loot directory."""
+    pf = Path(pathfinder_path)
+    if not (pf / "main" / "pathfinder.py").exists():
+        err(f"PathFinder not found at '{pf}' (expected a sibling PathFinder/ with main/pathfinder.py).")
+        return
+
+    loot_abs = os.path.abspath(loot)
+    info(f"Launching PathFinder on {loot_abs}")
+    cmd = [sys.executable, "-m", "main.pathfinder", "scan", loot_abs]
+    try:
+        subprocess.run(cmd, cwd=str(pf))
+    except Exception as exc:
+        err(f"PathFinder invocation failed: {exc}")
+
+
+# =========================
 # CLI
 # =========================
 
@@ -1619,7 +2121,29 @@ def parse_args() -> argparse.Namespace:
         default="scan_results",
         help="Base output directory when --save is used (default: scan_results)",
     )
+    parser.add_argument(
+        "--suggest",
+        action="store_true",
+        help="Print the follow-up enumeration commands for PathFinder to consume, "
+             "and write a runnable recon script",
+    )
+    parser.add_argument(
+        "--run",
+        action="store_true",
+        help="Run the unauthenticated recon commands (skipping missing tools), then "
+             "hand the results to PathFinder. Intended for the Kali/attack host.",
+    )
+    parser.add_argument(
+        "--run-threads",
+        type=int,
+        default=4,
+        help="Max enumeration tools to run concurrently with --run (default: 4)",
+    )
     args = parser.parse_args()
+    if args.run_threads < 1:
+        parser.error("--run-threads must be >= 1.")
+    if args.suggest and args.run:
+        parser.error("Use either --suggest or --run, not both.")
     if args.llm_endpoint and args.llm_full:
         parser.error("Use either --llm-endpoint or --llm-full, not both.")
     if args.llm_endpoint and args.hello:
@@ -1770,6 +2294,7 @@ def main() -> None:
     print()
 
     csv_rows: List[Dict[str, str]] = []
+    all_suggestions: List[Dict[str, Any]] = []
 
     for idx, target in enumerate(targets, start=1):
         print(color(f"[{idx}/{len(targets)}] {target}", C.BOLD))
@@ -1821,6 +2346,15 @@ def main() -> None:
 
         print_host_summary(ip_addr, hostname, extra, tcp_services, udp_services)
 
+        if args.suggest or args.run:
+            host_suggestions = suggest_for_host(
+                ip_addr, tcp_services, udp_services,
+                LOOT_DIR, DEFAULT_WEB_WORDLIST, DEFAULT_USER_WORDLIST,
+            )
+            if args.suggest:
+                print_suggestions(ip_addr, host_suggestions)
+            all_suggestions.extend(host_suggestions)
+
         if args.save and host_dir:
             write_host_report(host_dir, ip_addr, hostname, extra, tcp_services, udp_services)
 
@@ -1857,6 +2391,27 @@ def main() -> None:
         good("Per-host reports and raw XML saved under the output directory.")
     else:
         good("Done.")
+
+    if args.suggest and all_suggestions:
+        script_dir = base_outdir if (args.save and base_outdir) else Path(".")
+        try:
+            written = write_recon_scripts(script_dir, all_suggestions, LOOT_DIR)
+            for path in written:
+                good(f"Recon script written: {path}")
+            good(f"Next: run the script, then `{PATHFINDER_SCAN_CMD} {LOOT_DIR}/`")
+        except OSError as exc:
+            err(f"Could not write recon script: {exc}")
+
+    if args.run:
+        if not all_suggestions:
+            warn("--run: no suggestions generated from discovered services; nothing to run.")
+        else:
+            run_suggestions(
+                all_suggestions, LOOT_DIR, DEFAULT_WEB_WORDLIST, DEFAULT_USER_WORDLIST,
+                threads=args.run_threads,
+            )
+            pathfinder_path = str(Path(__file__).resolve().parent.parent / "PathFinder")
+            run_pathfinder(pathfinder_path, LOOT_DIR)
 
 
 if __name__ == "__main__":
