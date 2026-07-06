@@ -98,6 +98,23 @@ bash pathfinder_recon.sh
 python3 -m main.pathfinder scan loot/
 ```
 
+Output is organised **one subdirectory per host** (`loot/<host>/…`), and each
+host's nmap XML is dropped in alongside its follow-up results. That means a
+multi-host engagement stays in a single loot tree, files from different hosts
+never collide, and PathFinder attributes every finding to the right host and
+correlates credentials across them:
+
+```
+loot/
+├── 10.10.10.10/
+│   ├── nmap.xml
+│   ├── gobuster_80.txt
+│   └── nxc_10.10.10.10.log
+└── 10.10.10.20/
+    ├── nmap.xml
+    └── linpeas_10.10.10.20.txt
+```
+
 ### `--run`
 
 Runs the whole pipeline for you: executes the unauthenticated recon commands
@@ -108,27 +125,33 @@ post-foothold commands are never executed. Intended for the Kali/attack host
 
 ```bash
 python one-shot-enum.py 10.10.10.10 --run
-python one-shot-enum.py 10.10.10.10 --run --run-threads 8   # more concurrency
+python one-shot-enum.py 10.10.10.0/24 --run           # concurrency auto-scales to hosts
+python one-shot-enum.py 10.10.10.10 --run --run-timeout 300
 ```
 
-Tools run **concurrently** in a bounded worker pool (`--run-threads`, default 4).
-Because their output can't be sensibly interleaved, the terminal shows a live
+**Concurrency is one lane per host** — each host runs up to two tools at once and
+the lanes run in parallel, so a multi-host sweep goes fast while no single target
+is ever hammered (and a single box still gets two-way parallelism). There is
+nothing to tune; concurrency scales with the number of hosts automatically.
+
+Because tool output can't be sensibly interleaved, the terminal shows a live
 status table — one row per tool with its state, elapsed time, and latest
 progress line:
 
 ```
-Recon [4 workers]: 3 running, 2 done, 1 skipped, 0 other
+Recon [2 host lane(s), 2/host]: 3 running, 2 done, 1 skipped, 0 other
   gobuster    10.10.10.10   running   00:42  | Progress: 4120 / 87664
   ffuf        10.10.10.10   running   00:42  | :: 38200/220560 :: 900 req/s
-  nuclei      10.10.10.10   running   00:41  | [info] templates 1200/5000
+  nuclei      10.10.10.20   running   00:41  | [info] templates 1200/5000
   whatweb     10.10.10.10   done      00:03
-  nikto       10.10.10.10   done      00:38
-  smbmap      10.10.10.10   skip (no tool)   --:--
+  smbmap      10.10.10.20   skip (no tool)   --:--
 ```
 
-Each tool's full output is captured to `loot/_logs/<tool>_<host>.log` so nothing
-is lost and failures stay diagnosable. Lower `--run-threads 1` to go easy on a
-single target; raise it for multi-host sweeps.
+A tool that produces **no output for `--run-timeout` seconds (default 180)** is
+treated as hung and killed — so one stuck scanner never stalls the pipeline; it's
+marked `timed out` and the other lanes carry on. Set `--run-timeout 0` to
+disable. Each tool's full output is captured to `loot/_logs/<tool>_<host>.log` so
+nothing is lost and failures stay diagnosable.
 
 ## Requirements
 
