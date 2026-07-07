@@ -23,6 +23,7 @@ python one-shot-enum.py 10.10.10.0/24 --threads 20
 python one-shot-enum.py 10.10.10.10-20 --ports 22,80,443,8000-8010
 python one-shot-enum.py localhost --llm-endpoint
 python one-shot-enum.py 10.10.10.5 --llm-full --hello --save
+python one-shot-enum.py 10.10.10.5 --ai-paths
 ```
 
 Supported targets:
@@ -46,13 +47,47 @@ Supported targets:
 - Colorized terminal output, disabled with `--no-color`
 - Localhost fallback mode when `nmap` is unavailable
 
-## LLM/API enumeration
+## LLM/AI enumeration
 
-Use `--llm-endpoint` to detect LLM/API-like HTTP services and output only discovered OpenAPI endpoints.
+Two modes, quick vs rich:
 
-Use `--llm-full` to run the fuller LLM/API enumeration. This includes OpenAPI endpoint listing plus probes for common documentation, model, chat, health, metrics, config, and related paths.
+- `--llm-endpoint` — a **quick, read-only peek**: detect LLM/API-like HTTP services and list their discovered OpenAPI endpoints. No path probing, no PathFinder handoff.
+- `--ai-paths` — the **rich** mode: probe *all* HTTP-like services, fingerprint common AI/ML/RAG components (OpenAI-compatible APIs, Ollama, vLLM, TGI, LangServe, Gradio, agent/MCP, vector stores, MLflow, model servers, Jupyter, workflow builders, image-gen), and print prioritized attack-path next steps. `--ai-paths` is a strict superset of `--llm-endpoint`. With `--suggest`/`--run` it also hands the detected surfaces to PathFinder (see below).
 
-Use `--hello` with `--llm-full` to send a small test prompt to a discovered `/chat` endpoint. `--hello` also enables `--llm-full` when used by itself.
+Enumeration is read-only — it fingerprints and lists; it never sends prompts to a model. Prompt injection / jailbreak testing is left to you (PathFinder's AI rules point you at it).
+
+Current fingerprints include:
+
+- OpenAI-compatible APIs, vLLM, TGI, Ollama, LangServe, and Gradio
+- MCP and agent discovery surfaces
+- RAG/vector stores such as Qdrant, Chroma, Weaviate, OpenSearch, and Elasticsearch
+- MLflow, TorchServe, Triton, BentoML, TensorFlow Serving, and generic model-serving APIs
+- Jupyter, Flowise, Dify, AnythingLLM, Stable Diffusion WebUI, and ComfyUI
+
+Example:
+
+```bash
+python one-shot-enum.py 10.10.10.5 --ports 80,443,8000-9000 --ai-paths --save
+```
+
+The output keeps the raw evidence visible, then adds an `AI attack pathfinder` block with the inferred surface and the next practical checks, such as model listing, schema recovery, RAG/vector collection enumeration, agent/tool manifest review, or safe test prompts.
+
+### Handoff to PathFinder
+
+The inline `AI attack pathfinder` block is for immediate triage during the scan.
+For prioritized, correlated, reportable attack paths, combine `--ai-paths` with
+`--suggest`/`--run`: each host's detected AI surfaces are written to
+`loot/<host>/llm_enum_<port>.json`, which [PathFinder](../PathFinder) ingests as
+`ai_service` findings and maps to OWASP-LLM-aligned attack paths (prompt
+injection, agent/tool abuse, RAG poisoning, MLflow/Jupyter RCE, and more) —
+scored and deduped alongside the rest of the engagement.
+
+```bash
+python one-shot-enum.py 10.10.10.5 --ports 80,443,8000-9000 --ai-paths --run
+```
+
+This keeps the division clean: one-shot-enum does the live AI *enumeration*;
+PathFinder does the attack-path *synthesis*.
 
 ## Output
 
@@ -152,6 +187,20 @@ treated as hung and killed — so one stuck scanner never stalls the pipeline; i
 marked `timed out` and the other lanes carry on. Set `--run-timeout 0` to
 disable. Each tool's full output is captured to `loot/_logs/<tool>_<host>.log` so
 nothing is lost and failures stay diagnosable.
+
+### OSCP profile
+
+`--oscp` (works with `--suggest` or `--run`) omits tools restricted on the OSCP
+exam — currently **nuclei** and **sqlmap** — from the suggestions and runs, and
+prints what it left out. With `--run` it also passes `--oscp` through to
+PathFinder, so the whole pipeline stays exam-safe from a single flag:
+
+```bash
+python one-shot-enum.py 10.10.10.10 --run --oscp
+```
+
+Metasploit isn't suggested here; PathFinder adds its one-target reminder.
+Exam rules change — always verify against the current PEN-200 guide.
 
 ## Requirements
 

@@ -20,10 +20,10 @@ Features:
     - Targeted TCP service scan (-Pn -T3 -sC -sV) on discovered open ports
 - Optional UDP:
     - UDP top-ports scan (-Pn -T3 -sU --top-ports N)
-- Optional LLM/API enum:
-    - With --llm-endpoint, detect LLM/API-like services and list OpenAPI endpoints
-    - With --llm-full, also probe useful config/model/chat paths
-    - With --hello, send a test prompt to /chat when discovered
+- Optional LLM/AI enum:
+    - With --llm-endpoint, quick read-only peek: list OpenAPI endpoints on LLM/API-like services
+    - With --ai-paths, probe all HTTP-like services for AI/ML/RAG fingerprints, propose attack
+      paths, and (with --suggest/--run) hand the surfaces to PathFinder
 - Local fallback:
     - If nmap is missing, localhost scans fall back to pure-Python TCP/service checks
 - Output:
@@ -692,7 +692,6 @@ def service_banner(service: Service) -> str:
 # =========================
 
 HTTP_METHODS = {"get", "post", "put", "patch", "delete", "options", "head", "trace"}
-LLM_CHAT_MESSAGE = "Hello, what can you help me with and what are your capabilities?"
 HTTP_TIMEOUT_SECONDS = 5
 PROBE_TIMEOUT_SECONDS = 2
 MAX_RESPONSE_CHARS = 6000
@@ -735,11 +734,33 @@ LLM_SERVICE_INDICATORS = (
     "anythingllm",
     "localai",
     "llamafile",
+    "mlflow",
+    "bentoml",
+    "bento",
+    "torchserve",
+    "triton inference server",
+    "tritonserver",
+    "tensorflow serving",
+    "ray dashboard",
+    "jupyter",
+    "qdrant",
+    "weaviate",
+    "chroma",
+    "chromadb",
+    "milvus",
+    "elasticsearch",
+    "opensearch",
+    "qdrant",
+    "stable diffusion",
+    "comfyui",
 )
 OPENAPI_CANDIDATE_PATHS = (
     "/openapi.json",
     "/api/openapi.json",
     "/api/v1/openapi.json",
+    "/v1/openapi.json",
+    "/docs/openapi.json",
+    "/swagger/v1/swagger.json",
     "/swagger.json",
 )
 LLM_PROBE_PATHS = (
@@ -759,16 +780,86 @@ LLM_PROBE_PATHS = (
     "/swagger",
     "/swagger-ui",
     "/swagger-ui.html",
+    "/api/docs",
+    "/api/swagger",
     "/chat",
     "/chat/",
     "/v1/models",
+    "/v1/model/info",
     "/v1/chat/completions",
+    "/v1/responses",
     "/v1/completions",
     "/v1/embeddings",
+    "/v1/audio/transcriptions",
+    "/v1/moderations",
+    "/v1/rerank",
+    "/v1/score",
+    "/v1/tokenize",
+    "/v1/detokenize",
     "/api/tags",
+    "/api/version",
+    "/api/ps",
     "/api/generate",
     "/api/chat",
+    "/api/embeddings",
+    "/api/show",
+    "/info",
+    "/generate",
+    "/generate_stream",
+    "/tokenize",
+    "/detokenize",
+    "/invocations",
+    "/predict",
+    "/predictions",
+    "/models",
+    "/ping",
+    "/v2",
+    "/v2/health/live",
+    "/v2/health/ready",
+    "/v2/models",
+    "/api/2.0/mlflow/experiments/search",
+    "/api/2.0/mlflow/registered-models/search",
+    "/api/2.0/mlflow/model-versions/search",
+    "/ajax-api/2.0/mlflow/experiments/search",
+    "/api/status",
+    "/api/sessions",
+    "/api/kernels",
+    "/queue/status",
+    "/config",
+    "/info",
+    "/api/predict",
+    "/run/predict",
+    "/call/predict",
+    "/invoke",
+    "/batch",
+    "/stream",
+    "/input_schema",
+    "/output_schema",
+    "/config_schema",
+    "/api/v1/prediction",
+    "/api/v1/chatflows",
+    "/api/v1/credentials",
+    "/v1/chat-messages",
+    "/v1/completion-messages",
+    "/api/workspaces",
+    "/api/workspace",
+    "/collections",
+    "/collections/",
+    "/api/v1/heartbeat",
+    "/api/v1/collections",
+    "/v1/meta",
+    "/v1/schema",
+    "/v1/.well-known/ready",
+    "/v1/.well-known/live",
+    "/_cluster/health",
+    "/_cat/indices",
+    "/_aliases",
+    "/sdapi/v1/sd-models",
+    "/sdapi/v1/options",
+    "/object_info",
+    "/system_stats",
     "/mcp",
+    "/mcp/",
     "/sse",
     "/messages",
     "/health",
@@ -780,6 +871,86 @@ LLM_PROBE_PATHS = (
     "/config",
     "/config.json",
 )
+AI_SURFACE_NEXT_STEPS = {
+    "openai-compatible": [
+        "GET /v1/models to list model IDs and confirm auth requirements.",
+        "POST /v1/chat/completions with a harmless prompt and explicit model.",
+        "Check for tool/function calling, system-prompt leakage, and weak output guardrails.",
+        "If RAG endpoints also exist, move to indirect prompt injection and source extraction tests.",
+    ],
+    "ollama": [
+        "GET /api/tags to list local models.",
+        "POST /api/generate or /api/chat with a harmless capability prompt.",
+        "Check whether model pull/create/delete endpoints are exposed or unauthenticated.",
+        "If remote callbacks are in scope, test whether prompts can trigger tool or URL fetch behavior.",
+    ],
+    "vllm": [
+        "GET /v1/models and /version or /metrics to confirm vLLM exposure.",
+        "POST /v1/chat/completions with the discovered model ID.",
+        "Probe tokenizer endpoints if exposed; compare prompt filtering before and after tokenization.",
+        "Check whether LoRA adapter or served-model arguments leak through banners, docs, or metrics.",
+    ],
+    "tgi": [
+        "GET /info to identify Text Generation Inference model metadata.",
+        "POST /generate with a benign prompt and short max_new_tokens.",
+        "Check /metrics for model name, queue pressure, and deployment hints.",
+        "Test prompt injection and streaming output handling once generation is confirmed.",
+    ],
+    "gradio": [
+        "GET /config and /info to recover function names, parameters, and queue behavior.",
+        "POST /api/predict or /run/predict using the discovered fn_index/schema.",
+        "Inspect file upload parameters for path traversal, SSRF, or unsafe processing.",
+        "If a chatbot component exists, test prompt injection and history handling.",
+    ],
+    "langserve": [
+        "GET /input_schema, /output_schema, and /config_schema to recover chain inputs.",
+        "POST /invoke with the minimum valid schema.",
+        "Check /stream and /batch for weaker validation than /invoke.",
+        "If retriever fields exist, test query rewriting, source disclosure, and RAG poisoning paths.",
+    ],
+    "agent-mcp": [
+        "Fetch /.well-known/agent.json or tool manifests and record capabilities.",
+        "Probe /mcp, /sse, and /messages for transport, auth, and session requirements.",
+        "Look for file, shell, browser, HTTP fetch, email, GitHub, or cloud tools.",
+        "Test tool argument injection and confused-deputy behavior with low-impact inputs first.",
+    ],
+    "rag-vector": [
+        "List collections/indexes and sample metadata with the lowest-impact read endpoint.",
+        "Identify embedding model, chunking hints, document titles, and tenant boundaries.",
+        "Test whether writes/uploads are allowed before attempting any poisoning.",
+        "If readable, search chunks for prompts, secrets, source docs, and tool instructions.",
+    ],
+    "mlflow": [
+        "List experiments, registered models, and model versions via MLflow API endpoints.",
+        "Check artifact URIs for writable stores, credentials, or local filesystem paths.",
+        "Identify model flavors and unsafe loaders such as pickle, pyfunc, joblib, or torch.",
+        "If write access exists, follow the artifact consumer before testing model/package tampering.",
+    ],
+    "model-serving": [
+        "List loaded models and versions.",
+        "Check health/readiness plus metrics for model names, paths, and backend framework.",
+        "Send a minimal inference request only after recovering the expected schema.",
+        "Look for model repository write paths, unsafe deserialization, and shared cache directories.",
+    ],
+    "notebook": [
+        "Check whether token auth is required for /api/status, /api/sessions, and /api/kernels.",
+        "If authenticated, enumerate notebooks and kernels without executing code first.",
+        "Look for exposed files, saved credentials, environment variables, and mounted project paths.",
+        "Treat kernel execution as code execution and preserve evidence carefully.",
+    ],
+    "ai-workflow": [
+        "Enumerate workflow/chatflow definitions, credentials references, and public prediction endpoints.",
+        "Identify nodes that fetch URLs, call tools, run code, or access vector stores.",
+        "Test unauthenticated prediction with benign inputs before prompt/tool abuse.",
+        "Check exported flows for embedded API keys, database URLs, or agent prompts.",
+    ],
+    "image-generation": [
+        "List models, samplers, nodes, or workflow object info.",
+        "Check file upload/output directories and whether paths are user-controlled.",
+        "Test harmless generation parameters before probing plugin or custom-node behavior.",
+        "Look for model/plugin supply-chain paths and exposed filesystem mounts.",
+    ],
+}
 
 
 def resembles_llm_service(service: Service) -> bool:
@@ -859,11 +1030,6 @@ def http_request(url: str,
         "error": "",
     }
 
-
-def format_response_body(response: Dict[str, Any]) -> str:
-    if response.get("json") is not None:
-        return truncate_text(json.dumps(response["json"], indent=2, sort_keys=True))
-    return truncate_text(response.get("text", "").strip())
 
 
 def format_probe_json_preview(response: Dict[str, Any]) -> List[str]:
@@ -963,6 +1129,180 @@ def parse_openapi_endpoints(openapi_doc: Any) -> List[Dict[str, str]]:
     return endpoints
 
 
+def _normalized_ai_paths(llm_enum: Dict[str, Any]) -> Set[str]:
+    paths: Set[str] = set()
+    for endpoint in llm_enum.get("endpoints", []):
+        path = str(endpoint.get("path", "")).strip().lower().rstrip("/")
+        if path:
+            paths.add(path or "/")
+    for hit in llm_enum.get("probe_hits", []):
+        path = str(hit.get("path", "")).strip().lower().rstrip("/")
+        if path:
+            paths.add(path or "/")
+    return paths
+
+
+def _ai_preview_text(llm_enum: Dict[str, Any]) -> str:
+    chunks: List[str] = []
+    for hit in llm_enum.get("probe_hits", []):
+        chunks.append(str(hit.get("preview", "")))
+        chunks.extend(str(line) for line in hit.get("json_preview_lines", []))
+    return " ".join(chunks).lower()
+
+
+def _path_matches(paths: Set[str], candidates: Tuple[str, ...]) -> bool:
+    wanted = tuple(candidate.lower().rstrip("/") or "/" for candidate in candidates)
+    for path in paths:
+        if path in wanted:
+            return True
+        if any(candidate.endswith("/") and path.startswith(candidate.rstrip("/")) for candidate in wanted):
+            return True
+    return False
+
+
+def _path_contains(paths: Set[str], *needles: str) -> bool:
+    return any(any(needle in path for needle in needles) for path in paths)
+
+
+def _add_ai_surface(surfaces: Dict[str, Dict[str, Any]],
+                    key: str,
+                    label: str,
+                    confidence: str,
+                    evidence: List[str]) -> None:
+    confidence_rank = {"low": 1, "medium": 2, "high": 3}
+    existing = surfaces.get(key)
+    if existing is None:
+        surfaces[key] = {
+            "key": key,
+            "label": label,
+            "confidence": confidence,
+            "evidence": [],
+            "next_steps": AI_SURFACE_NEXT_STEPS.get(key, []),
+        }
+        existing = surfaces[key]
+    if confidence_rank.get(confidence, 0) > confidence_rank.get(existing["confidence"], 0):
+        existing["confidence"] = confidence
+    for item in evidence:
+        if item and item not in existing["evidence"]:
+            existing["evidence"].append(item)
+
+
+def infer_ai_surfaces(service: Service, llm_enum: Dict[str, Any]) -> List[Dict[str, Any]]:
+    paths = _normalized_ai_paths(llm_enum)
+    preview = _ai_preview_text(llm_enum)
+    banner = " ".join([
+        service_banner(service),
+        service.get("scripts", ""),
+        service.get("service", ""),
+        service.get("product", ""),
+        service.get("extrainfo", ""),
+    ]).lower()
+    endpoints = llm_enum.get("endpoints", [])
+    surfaces: Dict[str, Dict[str, Any]] = {}
+
+    if _path_matches(paths, ("/v1/chat/completions", "/v1/completions", "/v1/responses", "/v1/embeddings")):
+        _add_ai_surface(
+            surfaces,
+            "openai-compatible",
+            "OpenAI-compatible LLM API",
+            "high",
+            ["OpenAI-style /v1 generation or embedding endpoint exposed"],
+        )
+    elif _path_matches(paths, ("/v1/models",)) and ("openai" in banner or "openai" in preview or endpoints):
+        _add_ai_surface(
+            surfaces,
+            "openai-compatible",
+            "OpenAI-compatible LLM API",
+            "medium",
+            ["/v1/models-style endpoint exposed"],
+        )
+
+    if "vllm" in banner or "vllm" in preview:
+        _add_ai_surface(surfaces, "vllm", "vLLM OpenAI-compatible server", "high", ["vLLM marker in banner or response"])
+    elif _path_matches(paths, ("/v1/tokenize", "/v1/detokenize", "/v1/score")):
+        _add_ai_surface(surfaces, "vllm", "Possible vLLM server", "medium", ["vLLM-like tokenizer or score endpoint exposed"])
+
+    if "text generation inference" in banner or "text-generation-inference" in banner or "text generation inference" in preview:
+        _add_ai_surface(surfaces, "tgi", "Hugging Face Text Generation Inference", "high", ["TGI marker in banner or response"])
+    elif _path_matches(paths, ("/generate", "/generate_stream")) and not _path_matches(paths, ("/api/generate",)):
+        _add_ai_surface(surfaces, "tgi", "Possible text-generation inference API", "medium", ["/info or /generate endpoint exposed"])
+
+    if _path_matches(paths, ("/api/tags", "/api/generate", "/api/chat", "/api/ps", "/api/show")):
+        _add_ai_surface(surfaces, "ollama", "Ollama API", "high", ["Ollama /api/* endpoint exposed"])
+    elif "ollama" in banner or "ollama" in preview:
+        _add_ai_surface(surfaces, "ollama", "Ollama API", "medium", ["Ollama marker in banner or response"])
+
+    if _path_matches(paths, ("/config", "/queue/status", "/api/predict", "/run/predict", "/call/predict")) and (
+        "gradio" in banner or "gradio" in preview or _path_matches(paths, ("/queue/status",))
+    ):
+        _add_ai_surface(surfaces, "gradio", "Gradio app", "high", ["Gradio config, queue, or predict endpoint exposed"])
+
+    if _path_matches(paths, ("/invoke", "/batch", "/stream", "/input_schema", "/output_schema", "/config_schema")):
+        _add_ai_surface(surfaces, "langserve", "LangServe/LangChain API", "high", ["LangServe invoke/schema endpoint exposed"])
+    elif "langchain" in banner or "langserve" in banner or "langchain" in preview:
+        _add_ai_surface(surfaces, "langserve", "Possible LangChain/LangServe API", "medium", ["LangChain/LangServe marker in banner or response"])
+
+    if _path_matches(paths, ("/.well-known/agent.json", "/agent.json", "/mcp", "/sse", "/messages")):
+        _add_ai_surface(surfaces, "agent-mcp", "Agent/MCP surface", "high", ["Agent manifest, MCP, SSE, or messages endpoint exposed"])
+    elif "model context protocol" in banner or " mcp " in f" {banner} " or "model context protocol" in preview:
+        _add_ai_surface(surfaces, "agent-mcp", "Possible Agent/MCP surface", "medium", ["MCP marker in banner or response"])
+
+    if _path_matches(paths, ("/collections", "/api/v1/collections", "/v1/meta", "/v1/schema", "/_cat/indices", "/_cluster/health")):
+        _add_ai_surface(surfaces, "rag-vector", "Vector DB / RAG data store", "high", ["Vector/index collection endpoint exposed"])
+    elif any(marker in banner or marker in preview for marker in ("qdrant", "chromadb", "chroma", "weaviate", "milvus", "opensearch", "elasticsearch")):
+        _add_ai_surface(surfaces, "rag-vector", "Possible Vector DB / RAG data store", "medium", ["Vector-store marker in banner or response"])
+
+    if _path_contains(paths, "mlflow") or "mlflow" in banner or "mlflow" in preview:
+        _add_ai_surface(surfaces, "mlflow", "MLflow tracking/model registry", "high", ["MLflow API endpoint or marker exposed"])
+
+    if _path_matches(paths, ("/v2/models", "/v2/health/live", "/v2/health/ready")):
+        _add_ai_surface(surfaces, "model-serving", "Triton-style model serving API", "medium", ["Triton-style /v2 model-serving endpoint exposed"])
+    elif _path_matches(paths, ("/models", "/predictions")) and _path_matches(paths, ("/ping", "/invocations", "/predict")):
+        _add_ai_surface(surfaces, "model-serving", "Generic model serving API", "medium", ["Model listing plus prediction/health endpoint exposed"])
+    if any(marker in banner or marker in preview for marker in ("torchserve", "triton", "tensorflow serving", "bentoml", "bento")):
+        _add_ai_surface(surfaces, "model-serving", "Model serving API", "high", ["Model-serving framework marker in banner or response"])
+
+    if _path_matches(paths, ("/api/sessions", "/api/kernels")) or "jupyter" in banner or "jupyter" in preview:
+        _add_ai_surface(surfaces, "notebook", "Jupyter notebook/server", "high", ["Jupyter API endpoint or marker exposed"])
+
+    if _path_matches(paths, ("/api/v1/prediction", "/api/v1/chatflows", "/api/v1/credentials", "/v1/chat-messages", "/api/workspace", "/api/workspaces")):
+        _add_ai_surface(surfaces, "ai-workflow", "AI workflow/chatbot builder", "high", ["Workflow/chatflow or hosted chat endpoint exposed"])
+    elif any(marker in banner or marker in preview for marker in ("flowise", "dify", "anythingllm")):
+        _add_ai_surface(surfaces, "ai-workflow", "Possible AI workflow/chatbot builder", "medium", ["Workflow platform marker in banner or response"])
+
+    if _path_matches(paths, ("/sdapi/v1/sd-models", "/sdapi/v1/options", "/object_info", "/system_stats")):
+        _add_ai_surface(surfaces, "image-generation", "Image-generation API", "high", ["Stable Diffusion or ComfyUI endpoint exposed"])
+
+    ordered = sorted(
+        surfaces.values(),
+        key=lambda item: ({"high": 3, "medium": 2, "low": 1}.get(item["confidence"], 0), item["label"]),
+        reverse=True,
+    )
+    return ordered
+
+
+def ai_surface_lines(llm_enum: Dict[str, Any]) -> List[str]:
+    surfaces = llm_enum.get("ai_surfaces", [])
+    ai_paths_mode = bool(llm_enum.get("ai_paths_mode"))
+    if not surfaces:
+        if ai_paths_mode:
+            return [
+                "AI attack pathfinder:",
+                "  No known AI/ML/RAG fingerprint inferred from probes.",
+                "  Next: inspect OpenAPI/docs manually, check auth on interesting 200/401/403 paths, then broaden with web/content discovery.",
+            ]
+        return []
+
+    lines = ["AI attack pathfinder:"]
+    for surface in surfaces:
+        lines.append(f"  {surface['label']} ({surface['confidence']} confidence)")
+        for evidence in surface.get("evidence", [])[:3]:
+            lines.append(f"    Evidence: {evidence}")
+        for step in surface.get("next_steps", [])[:4]:
+            lines.append(f"    Next: {step}")
+    return lines
+
+
 def apply_openapi_response(result: Dict[str, Any], response: Dict[str, Any], url: str) -> None:
     result["openapi_url"] = url
     result["openapi_status"] = response.get("status")
@@ -979,8 +1319,8 @@ def apply_openapi_response(result: Dict[str, Any], response: Dict[str, Any], url
 
 def enumerate_llm_service(target: str,
                           service: Service,
-                          send_hello: bool = False,
-                          endpoint_only: bool = False) -> Dict[str, Any]:
+                          endpoint_only: bool = False,
+                          ai_paths_mode: bool = False) -> Dict[str, Any]:
     base_url = service_base_url(target, service)
     openapi_url = f"{base_url}{OPENAPI_CANDIDATE_PATHS[0]}"
     openapi_response = http_request(openapi_url)
@@ -988,17 +1328,15 @@ def enumerate_llm_service(target: str,
     result: Dict[str, Any] = {
         "base_url": base_url,
         "endpoint_only": endpoint_only,
+        "ai_paths_mode": ai_paths_mode,
         "openapi_url": "",
         "openapi_status": None,
         "openapi_error": "",
         "endpoints": [],
         "probe_count": len(LLM_PROBE_PATHS),
         "probe_hits": [],
+        "ai_surfaces": [],
         "chat_path": "",
-        "chat_attempted": False,
-        "chat_status": None,
-        "chat_error": "",
-        "chat_response": "",
     }
 
     apply_openapi_response(result, openapi_response, openapi_url)
@@ -1012,51 +1350,32 @@ def enumerate_llm_service(target: str,
                 break
 
     if endpoint_only:
+        result["ai_surfaces"] = infer_ai_surfaces(service, result)
         return result
 
     result["probe_hits"] = probe_llm_paths(base_url)
+    result["ai_surfaces"] = infer_ai_surfaces(service, result)
 
+    # Record whether a /chat endpoint exists (enumeration only; no prompt is sent).
     chat_path = next(
-        (
-            endpoint["path"]
-            for endpoint in result["endpoints"]
-            if endpoint["path"].rstrip("/") == "/chat"
-        ),
+        (endpoint["path"] for endpoint in result["endpoints"] if endpoint["path"].rstrip("/") == "/chat"),
         "",
     )
     if not chat_path:
         chat_path = next(
-            (
-                hit["path"]
-                for hit in result["probe_hits"]
-                if hit["path"].rstrip("/") == "/chat"
-            ),
+            (hit["path"] for hit in result["probe_hits"] if hit["path"].rstrip("/") == "/chat"),
             "",
         )
-
     result["chat_path"] = chat_path
-
-    if chat_path and send_hello:
-        chat_url = f"{base_url}{chat_path}"
-        chat_response = http_request(
-            chat_url,
-            method="POST",
-            payload={"message": LLM_CHAT_MESSAGE},
-        )
-        result["chat_attempted"] = True
-        result["chat_url"] = chat_url
-        result["chat_status"] = chat_response.get("status")
-        result["chat_error"] = chat_response.get("error", "")
-        result["chat_response"] = format_response_body(chat_response)
 
     return result
 
 
 def run_llm_enumeration(target: str,
                         tcp_services: List[Service],
-                        send_hello: bool = False,
                         endpoint_only: bool = False,
-                        probe_all_http: bool = False) -> None:
+                        probe_all_http: bool = False,
+                        ai_paths_mode: bool = False) -> None:
     for service in tcp_services:
         if not resembles_llm_service(service) and not (probe_all_http and is_http_like_service(service)):
             continue
@@ -1067,8 +1386,8 @@ def run_llm_enumeration(target: str,
         service["llm_enum"] = enumerate_llm_service(
             target,
             service,
-            send_hello=send_hello,
             endpoint_only=endpoint_only,
+            ai_paths_mode=ai_paths_mode,
         )
 
 
@@ -1109,24 +1428,12 @@ def llm_enum_lines(llm_enum: Dict[str, Any]) -> List[str]:
     else:
         lines.append(f"  Path probes: no interesting responses from {probe_count} checked")
 
-    if llm_enum.get("chat_attempted"):
-        chat_status = llm_enum.get("chat_status")
-        chat_status_text = f"status {chat_status}" if chat_status is not None else "no status"
-        chat_path = llm_enum.get("chat_path", "/chat")
-        lines.append(f"  POST {chat_path}: {chat_status_text}")
-        if llm_enum.get("chat_error"):
-            lines.append(f"    Error: {llm_enum['chat_error']}")
-        else:
-            response_body = llm_enum.get("chat_response", "").strip()
-            lines.append("    Response:")
-            if response_body:
-                lines.extend(f"      {line}" for line in response_body.splitlines())
-            else:
-                lines.append("      (empty response)")
-    elif llm_enum.get("chat_path"):
-        lines.append(f"  POST {llm_enum['chat_path']}: discovered; use --hello to send test prompt")
+    if llm_enum.get("chat_path"):
+        lines.append(f"  Chat endpoint discovered: {llm_enum['chat_path']} (test prompt injection manually)")
     else:
-        lines.append("  POST /chat: not found in OpenAPI or path probes")
+        lines.append("  Chat endpoint: not found in OpenAPI or path probes")
+
+    lines.extend(ai_surface_lines(llm_enum))
 
     return lines
 
@@ -1580,6 +1887,10 @@ PER_HOST_LANE = 2
 # Kill a tool that produces no output for this many seconds (a hang); 0 disables.
 DEFAULT_RUN_IDLE_TIMEOUT = 180
 
+# OSCP exam profile: suggestion tools restricted on the exam, omitted under --oscp.
+# (Metasploit isn't suggested here; PathFinder handles its one-target reminder.)
+OSCP_PROHIBITED_TOOLS = {"nuclei", "sqlmap"}
+
 WEB_PORTS = {80, 443, 591, 3000, 5000, 8000, 8008, 8080, 8081, 8088, 8180,
              8443, 8444, 8800, 8888, 9000, 9090, 9443}
 WEB_HTTPS_PORTS = {443, 8443, 8444, 9443, 2083, 2087, 2096}
@@ -1600,6 +1911,59 @@ def host_loot_dir(loot: str, host: str) -> str:
     it to that host. safe_name keeps IPs/hostnames intact (dots/hyphens preserved).
     """
     return f"{loot}/{safe_name(host)}"
+
+
+def write_llm_enum_loot(host: str, service: Service, loot: str) -> Optional[Path]:
+    """Write a service's LLM/AI surface enumeration into the loot dir as a
+    PathFinder-consumable JSON so PathFinder's AI/LLM rules can synthesise attack
+    paths from it. Returns the written path, or None if there's nothing to emit."""
+    llm_enum = service.get("llm_enum")
+    if not isinstance(llm_enum, dict) or not llm_enum.get("ai_surfaces"):
+        return None
+    try:
+        port_int = int(service.get("port"))
+    except (TypeError, ValueError):
+        port_int = None
+    payload = {
+        "tool": "one-shot-enum",
+        "type": "llm_enum",
+        "host": host,
+        "port": port_int,
+        "base_url": llm_enum.get("base_url"),
+        "service": {
+            "name": service.get("service", ""),
+            "product": service.get("product", ""),
+            "version": service.get("version", ""),
+            "banner": service_banner(service),
+        },
+        "openapi_url": llm_enum.get("openapi_url"),
+        "openapi_status": llm_enum.get("openapi_status"),
+        "openapi_error": llm_enum.get("openapi_error"),
+        "endpoints": llm_enum.get("endpoints", []),
+        "probe_count": llm_enum.get("probe_count"),
+        "probe_hits": [
+            {
+                "path": hit.get("path"),
+                "status": hit.get("status"),
+                "content_type": hit.get("content_type", ""),
+                "preview": hit.get("preview", ""),
+                "json_preview_lines": hit.get("json_preview_lines", []),
+            }
+            for hit in llm_enum.get("probe_hits", []) if isinstance(hit, dict)
+        ],
+        "chat_path": llm_enum.get("chat_path", ""),
+        "ai_surfaces": [
+            {"key": s.get("key"), "label": s.get("label"),
+             "confidence": s.get("confidence"), "evidence": s.get("evidence", []),
+             "next_steps": s.get("next_steps", [])}
+            for s in llm_enum.get("ai_surfaces", []) if isinstance(s, dict)
+        ],
+    }
+    host_dir = Path(host_loot_dir(loot, host))
+    host_dir.mkdir(parents=True, exist_ok=True)
+    out = host_dir / f"llm_enum_{safe_name(str(port_int) if port_int is not None else 'x')}.json"
+    write_text(out, json.dumps(payload, indent=2))
+    return out
 
 
 def _suggestion(host: str, group: str, tool: str, command: str, parser: str,
@@ -2137,7 +2501,7 @@ def run_suggestions(all_suggestions: List[Dict[str, Any]],
     return {"ran": ran, "skipped": skipped, "nonzero": nonzero, "failed": failed, "timed_out": timed_out}
 
 
-def run_pathfinder(pathfinder_path: str, loot: str) -> None:
+def run_pathfinder(pathfinder_path: str, loot: str, oscp: bool = False) -> None:
     """Invoke PathFinder's scan mode on the loot directory."""
     pf = Path(pathfinder_path)
     if not (pf / "main" / "pathfinder.py").exists():
@@ -2151,6 +2515,8 @@ def run_pathfinder(pathfinder_path: str, loot: str) -> None:
     findings_path = os.path.join(os.path.dirname(loot_abs), "findings.json")
     info(f"Launching PathFinder on {loot_abs} (findings -> {findings_path})")
     cmd = [sys.executable, "-m", "main.pathfinder", "scan", loot_abs, "-o", findings_path]
+    if oscp:
+        cmd.append("--oscp")  # keep the exam-safe profile consistent across the pipeline
     try:
         subprocess.run(cmd, cwd=str(pf))
     except Exception as exc:
@@ -2194,17 +2560,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--llm-endpoint",
         action="store_true",
-        help="For LLM/API-like services, list discovered OpenAPI endpoints only",
+        help="Quick, read-only peek: list discovered OpenAPI endpoints on LLM/API-like services",
     )
     parser.add_argument(
-        "--llm-full",
+        "--ai-paths",
         action="store_true",
-        help="For LLM/API-like services, enumerate OpenAPI and probe config/model/chat paths",
-    )
-    parser.add_argument(
-        "--hello",
-        action="store_true",
-        help="Send a test prompt to /chat when discovered during --llm-full enum",
+        help="Rich AI enumeration: probe all HTTP-like services for AI/ML/RAG fingerprints, print "
+             "prioritized attack-path next steps, and (with --suggest/--run) hand surfaces to PathFinder",
     )
     parser.add_argument(
         "--timing",
@@ -2246,15 +2608,19 @@ def parse_args() -> argparse.Namespace:
         help=f"With --run, kill a tool that produces no output for this many seconds "
              f"(a hang); 0 disables (default: {DEFAULT_RUN_IDLE_TIMEOUT})",
     )
+    parser.add_argument(
+        "--oscp",
+        action="store_true",
+        help="OSCP exam profile: omit restricted tools (" + ", ".join(sorted(OSCP_PROHIBITED_TOOLS)) +
+             ") from suggestions/runs, and pass --oscp through to PathFinder",
+    )
     args = parser.parse_args()
     if args.run_timeout < 0:
         parser.error("--run-timeout must be >= 0.")
     if args.suggest and args.run:
         parser.error("Use either --suggest or --run, not both.")
-    if args.llm_endpoint and args.llm_full:
-        parser.error("Use either --llm-endpoint or --llm-full, not both.")
-    if args.llm_endpoint and args.hello:
-        parser.error("--hello requires --llm-full and cannot be used with --llm-endpoint.")
+    if args.llm_endpoint and args.ai_paths:
+        parser.error("Use either --llm-endpoint (quick) or --ai-paths (rich), not both.")
     if any(is_localhost_target(target) for target in args.targets):
         normalized = {target.strip().lower() for target in args.targets}
         if len(normalized) > 1:
@@ -2270,8 +2636,6 @@ def main() -> None:
     args = parse_args()
     if args.no_color:
         set_color_mode(False)
-    if args.hello:
-        args.llm_full = True
 
     try:
         targets = normalize_targets(args.targets)
@@ -2336,11 +2700,9 @@ def main() -> None:
         else:
             info(f"UDP enabled: top {args.udp_top_ports} ports (timing: T3)")
     if args.llm_endpoint:
-        info("LLM/API endpoint enum enabled for matching services")
-    if args.llm_full:
-        info("LLM/API full enum enabled for matching services")
-    if args.hello:
-        info("Hello prompt enabled for discovered /chat endpoints")
+        info("LLM/API endpoint enum enabled (quick OpenAPI peek on matching services)")
+    if args.ai_paths:
+        info("AI attack pathfinder enabled for all HTTP-like services (surfaces handed to PathFinder with --suggest/--run)")
     info(f"Save output: {'yes' if args.save else 'no'}")
     if args.save and base_outdir:
         info(f"Output directory: {base_outdir}")
@@ -2402,6 +2764,7 @@ def main() -> None:
 
     csv_rows: List[Dict[str, str]] = []
     all_suggestions: List[Dict[str, Any]] = []
+    oscp_omitted: Set[str] = set()
 
     for idx, target in enumerate(targets, start=1):
         print(color(f"[{idx}/{len(targets)}] {target}", C.BOLD))
@@ -2434,14 +2797,14 @@ def main() -> None:
                 hostname = tcp_result.get("hostname", hostname)
                 extra = merge_extra_info(extra, tcp_result.get("extra", {}))
                 tcp_services = tcp_result.get("services", [])
-                if args.llm_endpoint or args.llm_full:
+                if args.llm_endpoint or args.ai_paths:
                     try:
                         run_llm_enumeration(
                             target,
                             tcp_services,
-                            send_hello=args.hello,
                             endpoint_only=args.llm_endpoint,
-                            probe_all_http=use_local_fallback,
+                            probe_all_http=use_local_fallback or args.ai_paths,
+                            ai_paths_mode=args.ai_paths,
                         )
                     except Exception as exc:
                         err(f"{target}: LLM/API enum failed: {exc}")
@@ -2461,10 +2824,26 @@ def main() -> None:
         print_host_summary(ip_addr, hostname, extra, tcp_services, udp_services)
 
         if args.suggest or args.run:
+            # Persist AI/LLM surfaces for PathFinder only in the rich --ai-paths mode
+            # (--llm-endpoint is a quick read-only peek and does not hand off).
+            if args.ai_paths:
+                for svc in tcp_services:
+                    written_llm = write_llm_enum_loot(loot_host, svc, LOOT_DIR)
+                    if written_llm:
+                        good(f"AI surfaces -> {written_llm}")
             host_suggestions = suggest_for_host(
                 loot_host, tcp_services, udp_services,
                 LOOT_DIR, DEFAULT_WEB_WORDLIST, DEFAULT_USER_WORDLIST,
             )
+            if args.oscp:
+                # Drop tools restricted on the OSCP exam (record what we omitted).
+                kept = []
+                for s in host_suggestions:
+                    if s["tool"] in OSCP_PROHIBITED_TOOLS:
+                        oscp_omitted.add(s["tool"])
+                    else:
+                        kept.append(s)
+                host_suggestions = kept
             if args.suggest:
                 # Use the same pinned host the loot paths are keyed on.
                 print_suggestions(loot_host, host_suggestions)
@@ -2507,6 +2886,13 @@ def main() -> None:
     else:
         good("Done.")
 
+    if args.oscp and (args.suggest or args.run):
+        if oscp_omitted:
+            warn(f"OSCP profile: omitted restricted tool(s): {', '.join(sorted(oscp_omitted))} "
+                 f"(not suggested/run on the exam).")
+        else:
+            info("OSCP profile active: no restricted tools were applicable to these hosts.")
+
     if args.suggest and all_suggestions:
         script_dir = base_outdir if (args.save and base_outdir) else Path(".")
         try:
@@ -2526,7 +2912,7 @@ def main() -> None:
                 idle_timeout=args.run_timeout,
             )
             pathfinder_path = str(Path(__file__).resolve().parent.parent / "PathFinder")
-            run_pathfinder(pathfinder_path, LOOT_DIR)
+            run_pathfinder(pathfinder_path, LOOT_DIR, oscp=args.oscp)
 
 
 if __name__ == "__main__":
