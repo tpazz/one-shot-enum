@@ -71,11 +71,12 @@ Service = Dict[str, Any]
 class C:
     RESET = "\033[0m"
     BOLD = "\033[1m"
-    RED = "\033[31m"
-    GREEN = "\033[32m"
-    YELLOW = "\033[33m"
-    BLUE = "\033[34m"
-    CYAN = "\033[36m"
+    # Bright palette to match PathFinder's styling.
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    CYAN = "\033[96m"
     GREY = "\033[90m"
 
 
@@ -97,27 +98,33 @@ def color(text: str, code: str) -> str:
     return f"{code}{text}{C.RESET}"
 
 
+def bold(text: str, code: str = "") -> str:
+    """Bold (optionally coloured) text - for section headers and emphasis."""
+    return color(text, C.BOLD + code)
+
+
 def info(msg: str) -> None:
-    print(color("[*]", C.BLUE), msg)
+    print(f"{color('[*]', C.BOLD + C.CYAN)} {msg}")
 
 
 def good(msg: str) -> None:
-    print(color("[+]", C.GREEN), msg)
+    print(f"{color('[+]', C.BOLD + C.GREEN)} {msg}")
 
 
 def warn(msg: str) -> None:
-    print(color("[!]", C.YELLOW), msg)
+    print(f"{color('[!]', C.BOLD + C.YELLOW)} {msg}")
 
 
 def err(msg: str) -> None:
-    print(color("[-]", C.RED), msg, file=sys.stderr)
+    print(f"{color('[-]', C.BOLD + C.RED)} {msg}", file=sys.stderr)
 
 
 def progress(msg: str) -> None:
+    tag = color("[>]", C.BOLD + C.CYAN)
     if sys.stdout.isatty():
-        print(f"\r{color('[>]', C.CYAN)} {msg:<120}", end="", flush=True)
+        print(f"\r{tag} {msg:<120}", end="", flush=True)
     else:
-        print(f"{color('[>]', C.CYAN)} {msg}")
+        print(f"{tag} {msg}")
 
 
 def clear_progress_line() -> None:
@@ -871,6 +878,24 @@ LLM_PROBE_PATHS = (
     "/config",
     "/config.json",
 )
+
+# Endpoints that represent an LLM chat/completions interface, across common stacks
+# (generic, Ollama, OpenAI-compatible, MCP-style). Used to report the chat surface.
+CHAT_ENDPOINT_PATHS = (
+    "/chat",
+    "/api/chat",
+    "/chat/completions",
+    "/v1/chat/completions",
+    "/v1/chat-messages",
+    "/v1/messages",
+    "/messages",
+)
+
+
+def _is_chat_endpoint(path: str) -> bool:
+    return str(path).rstrip("/").lower() in CHAT_ENDPOINT_PATHS
+
+
 AI_SURFACE_NEXT_STEPS = {
     "openai-compatible": [
         "GET /v1/models to list model IDs and confirm auth requirements.",
@@ -1284,22 +1309,26 @@ def infer_ai_surfaces(service: Service, llm_enum: Dict[str, Any]) -> List[Dict[s
 def ai_surface_lines(llm_enum: Dict[str, Any]) -> List[str]:
     surfaces = llm_enum.get("ai_surfaces", [])
     ai_paths_mode = bool(llm_enum.get("ai_paths_mode"))
+    header = bold("AI attack pathfinder:", C.CYAN)
     if not surfaces:
         if ai_paths_mode:
             return [
-                "AI attack pathfinder:",
+                header,
                 "  No known AI/ML/RAG fingerprint inferred from probes.",
-                "  Next: inspect OpenAPI/docs manually, check auth on interesting 200/401/403 paths, then broaden with web/content discovery.",
+                f"  {bold('Next:', C.YELLOW)} inspect OpenAPI/docs manually, check auth on interesting 200/401/403 paths, then broaden with web/content discovery.",
             ]
         return []
 
-    lines = ["AI attack pathfinder:"]
+    conf_colors = {"high": C.BOLD + C.RED, "medium": C.BOLD + C.YELLOW, "low": C.GREY}
+    lines = [header]
     for surface in surfaces:
-        lines.append(f"  {surface['label']} ({surface['confidence']} confidence)")
+        confidence = str(surface.get("confidence", "")).lower()
+        conf_str = color(f"{surface['confidence']} confidence", conf_colors.get(confidence, C.GREY))
+        lines.append(f"  {bold(surface['label'], C.RED)} ({conf_str})")
         for evidence in surface.get("evidence", [])[:3]:
-            lines.append(f"    Evidence: {evidence}")
+            lines.append(f"    {color('Evidence:', C.GREY)} {evidence}")
         for step in surface.get("next_steps", [])[:4]:
-            lines.append(f"    Next: {step}")
+            lines.append(f"    {bold('Next:', C.YELLOW)} {step}")
     return lines
 
 
@@ -1356,14 +1385,16 @@ def enumerate_llm_service(target: str,
     result["probe_hits"] = probe_llm_paths(base_url)
     result["ai_surfaces"] = infer_ai_surfaces(service, result)
 
-    # Record whether a /chat endpoint exists (enumeration only; no prompt is sent).
+    # Record whether a chat/completions endpoint exists, across common stacks
+    # (/chat, Ollama /api/chat, OpenAI /v1/chat/completions, ...). Enumeration
+    # only - no prompt is sent. A 405 (GET not allowed) still counts: it exists.
     chat_path = next(
-        (endpoint["path"] for endpoint in result["endpoints"] if endpoint["path"].rstrip("/") == "/chat"),
+        (endpoint["path"] for endpoint in result["endpoints"] if _is_chat_endpoint(endpoint.get("path", ""))),
         "",
     )
     if not chat_path:
         chat_path = next(
-            (hit["path"] for hit in result["probe_hits"] if hit["path"].rstrip("/") == "/chat"),
+            (hit["path"] for hit in result["probe_hits"] if _is_chat_endpoint(hit.get("path", ""))),
             "",
         )
     result["chat_path"] = chat_path
@@ -1393,7 +1424,7 @@ def run_llm_enumeration(target: str,
 
 def llm_enum_lines(llm_enum: Dict[str, Any]) -> List[str]:
     endpoint_only = bool(llm_enum.get("endpoint_only"))
-    lines: List[str] = ["LLM/API endpoint enum:" if endpoint_only else "LLM/API enum:"]
+    lines: List[str] = [bold("LLM/API endpoint enum:" if endpoint_only else "LLM/API enum:", C.CYAN)]
     status = llm_enum.get("openapi_status")
     status_text = f"status {status}" if status is not None else "no status"
 
@@ -1429,9 +1460,9 @@ def llm_enum_lines(llm_enum: Dict[str, Any]) -> List[str]:
         lines.append(f"  Path probes: no interesting responses from {probe_count} checked")
 
     if llm_enum.get("chat_path"):
-        lines.append(f"  Chat endpoint discovered: {llm_enum['chat_path']} (test prompt injection manually)")
+        lines.append(f"  {bold('Chat endpoint discovered:', C.GREEN)} {llm_enum['chat_path']} (test prompt injection manually)")
     else:
-        lines.append("  Chat endpoint: not found in OpenAPI or path probes")
+        lines.append(color("  Chat endpoint: not found in OpenAPI or path probes", C.GREY))
 
     lines.extend(ai_surface_lines(llm_enum))
 
@@ -1745,51 +1776,49 @@ def print_host_summary(ip_addr: str,
                        extra: Dict[str, str],
                        tcp_services: List[Service],
                        udp_services: List[Service]) -> None:
-    print("=" * 88)
+    print(bold("=" * 88, C.CYAN))
     host_line = f"Host: {ip_addr}"
     if hostname:
         host_line += f" ({hostname})"
-    print(color(host_line, C.BOLD))
+    print(bold(host_line, C.CYAN))
 
     if extra.get("mac"):
         mac_line = f"MAC: {extra['mac']}"
         if extra.get("vendor"):
             mac_line += f" [{extra['vendor']}]"
-        print(mac_line)
+        print(color(mac_line, C.GREY))
 
     if extra.get("lastboot"):
-        print(f"Last boot: {extra['lastboot']}")
+        print(color(f"Last boot: {extra['lastboot']}", C.GREY))
 
     if extra.get("os_guess"):
-        print(f"OS guess: {extra['os_guess']}")
+        print(f"{bold('OS guess:', C.YELLOW)} {extra['os_guess']}")
 
-    print("-" * 88)
+    print(color("-" * 88, C.GREY))
 
-    if tcp_services:
-        print(color("TCP", C.CYAN))
-        print(f"{'PORT':<10}{'PROTO':<8}{'SERVICE INFO'}")
-        print("-" * 88)
-        for svc in tcp_services:
-            print(f"{svc['port']:<10}{svc['protocol']:<8}{service_banner(svc)}")
+    def _print_service_table(services):
+        print(color(f"{'PORT':<10}{'PROTO':<8}{'SERVICE INFO'}", C.GREY))
+        print(color("-" * 88, C.GREY))
+        for svc in services:
+            port_col = color(f"{svc['port']:<10}", C.BOLD + C.GREEN)
+            print(f"{port_col}{svc['protocol']:<8}{service_banner(svc)}")
             if svc.get("llm_enum"):
                 for line in llm_enum_lines(svc["llm_enum"]):
                     print(f"{'':<18}{line}")
             if svc["scripts"]:
                 for sline in svc["scripts"].splitlines():
-                    print(f"{'':<18}└─ {sline}")
+                    print(color(f"{'':<18}└─ {sline}", C.GREY))
+
+    if tcp_services:
+        print(bold("TCP", C.CYAN))
+        _print_service_table(tcp_services)
     else:
-        print("No open TCP ports discovered.")
+        print(color("No open TCP ports discovered.", C.GREY))
 
     if udp_services:
-        print("-" * 88)
-        print(color("UDP", C.CYAN))
-        print(f"{'PORT':<10}{'PROTO':<8}{'SERVICE INFO'}")
-        print("-" * 88)
-        for svc in udp_services:
-            print(f"{svc['port']:<10}{svc['protocol']:<8}{service_banner(svc)}")
-            if svc["scripts"]:
-                for sline in svc["scripts"].splitlines():
-                    print(f"{'':<18}└─ {sline}")
+        print(color("-" * 88, C.GREY))
+        print(bold("UDP", C.CYAN))
+        _print_service_table(udp_services)
 
     print()
 
