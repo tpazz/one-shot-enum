@@ -43,6 +43,7 @@ import os
 import platform
 import queue
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -517,8 +518,20 @@ def run_nmap_with_progress(cmd: List[str], target: str, phase: str, proto: str =
     last_stats: str = ""
     combined_lines: List[str] = []
     last_render = 0.0
+    start_time = time.time()
+    timed_out = False
 
     while proc.poll() is None or not q.empty():
+        # Wall-clock ceiling: terminate a run that overruns the limit so one slow or
+        # filtered host can't pin this worker forever. Only counts while nmap runs.
+        if NMAP_SCAN_TIMEOUT and proc.poll() is None and (time.time() - start_time) > NMAP_SCAN_TIMEOUT:
+            timed_out = True
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            break
         try:
             line = q.get(timeout=0.2)
         except queue.Empty:
@@ -553,6 +566,10 @@ def run_nmap_with_progress(cmd: List[str], target: str, phase: str, proto: str =
 
     for t in threads:
         t.join(timeout=0.2)
+
+    if timed_out:
+        warn(f"[!] nmap {phase} on {target} exceeded the {NMAP_SCAN_TIMEOUT}s wall-clock limit; "
+             f"terminated (raise or disable with --scan-timeout). This host may be skipped.")
 
     return rc, "\n".join(combined_lines)
 
@@ -742,6 +759,9 @@ LLM_SERVICE_INDICATORS = (
     "localai",
     "llamafile",
     "mlflow",
+    "minio",
+    "amazon s3",
+    "amazons3",
     "bentoml",
     "bento",
     "torchserve",
@@ -776,8 +796,17 @@ LLM_PROBE_PATHS = (
     "/.well-known/oauth-authorization-server",
     "/.well-known/ai-plugin.json",
     "/.well-known/agent.json",
+    "/.well-known/agent-card.json",
     "/agent.json",
+    "/agent-card.json",
     "/ai-plugin.json",
+    "/agents",
+    "/api/agents",
+    "/a2a",
+    "/threads",
+    "/runs",
+    "/assistants",
+    "/kickoff",
     "/openapi.json",
     "/swagger.json",
     "/api/openapi.json",
@@ -828,6 +857,9 @@ LLM_PROBE_PATHS = (
     "/api/2.0/mlflow/registered-models/search",
     "/api/2.0/mlflow/model-versions/search",
     "/ajax-api/2.0/mlflow/experiments/search",
+    "/minio/health/live",
+    "/minio/health/ready",
+    "/minio/health/cluster",
     "/api/status",
     "/api/sessions",
     "/api/kernels",
@@ -869,6 +901,13 @@ LLM_PROBE_PATHS = (
     "/mcp/",
     "/sse",
     "/messages",
+    "/tools",
+    "/query",
+    "/ingest",
+    "/upload",
+    "/documents",
+    "/search",
+    "/workflow",
     "/health",
     "/healthz",
     "/ready",
@@ -894,6 +933,288 @@ CHAT_ENDPOINT_PATHS = (
 
 def _is_chat_endpoint(path: str) -> bool:
     return str(path).rstrip("/").lower() in CHAT_ENDPOINT_PATHS
+
+
+# Agent *role* inference: what the service does, from its endpoint/route names
+# (complements the framework fingerprint in AI_SURFACE_NEXT_STEPS). Substrings are
+# matched against discovered paths. Order in AGENT_ROLE_PRIORITY picks the primary
+# role when several capabilities are present. The capability set maps to the target
+# archetypes in the AI-Red-Team notes (KB/RAG, single-agent, multi-agent/A2A,
+# MCP tool server, embedding/vector store, NL-to-SQL, code-exec).
+AGENT_CAPABILITY_SIGNATURES = {
+    "code-execution": ("/exec", "/execute", "/run_code", "/run-code", "/eval", "/code", "/shell", "/sandbox", "/python", "/interpreter"),
+    "agent-discovery": ("/.well-known/agent", "/agent.json", "/agent-card", "/agents", "/a2a"),
+    "orchestration": ("/workflow", "/orchestrat", "/route", "/dispatch", "/delegate", "/supervisor",
+                      "/crew", "/kickoff", "/swarm", "/handoff", "/graph", "/pipeline"),
+    "mcp-tooling": ("/mcp", "/sse", "/jsonrpc", "/rpc", "/invoke", "/tools"),
+    "vector-store": ("/collection", "/points", "/scroll", "/objects", "/v1/schema", "/_search", "/_cat/indices", "/upsert"),
+    "knowledge-base": ("/kb", "/knowledge", "/rag", "/document", "/ingest", "/corpus", "/embed", "/retriev"),
+    "tool-calling": ("/tool", "/function", "/plugin", "/action", "tool-call"),
+    "database": ("/db", "/sql", "db-schema", "/table", "/datasource", "nl2sql", "text2sql", "text-to-sql"),
+    "web-browsing": ("/browse", "/fetch", "/crawl", "/scrape", "/render", "/url"),
+    "file-processing": ("/upload", "/summarize", "/review", "/parse", "/extract", "/ocr", "/file", "/transcri"),
+    "memory": ("/memory", "/history", "/recall", "/remember", "/thread"),
+    "conversational": ("/chat", "/session", "/message", "/conversation", "/completions", "/reset", "/query"),
+}
+AGENT_ROLE_PRIORITY = (
+    ("code-execution", "Code / Execution agent"),
+    ("agent-discovery", "A2A / multi-agent system"),
+    ("orchestration", "Multi-agent orchestrator"),
+    ("mcp-tooling", "MCP / tool server"),
+    ("vector-store", "Embedding / vector store"),
+    ("knowledge-base", "Knowledge Base / RAG agent"),
+    ("database", "Database / NL-to-SQL agent"),
+    ("web-browsing", "Web-browsing agent"),
+    ("tool-calling", "Tool-using single agent"),
+    ("file-processing", "Document-processing agent"),
+    ("memory", "Stateful / memory agent"),
+    ("conversational", "Conversational agent / chatbot"),
+)
+# High-level architecture (topology) derived from which capabilities are present.
+# This is the "KB/RAG vs Single vs Multi vs Embedding" bucket the notes describe.
+AGENT_ARCHITECTURE_RULES = (
+    ("multi-agent", ("agent-discovery", "orchestration")),
+    ("tool-server", ("mcp-tooling",)),
+    ("vector-store", ("vector-store",)),
+    ("rag", ("knowledge-base",)),
+    ("single-agent", ("code-execution", "tool-calling", "web-browsing",
+                      "database", "file-processing", "memory", "conversational")),
+)
+# Multi-agent / orchestration frameworks that leave HTTP path fingerprints
+# (from A2A.md). Checked in order; the first match wins. Answer-serving frameworks
+# (LangServe/Flowise/Dify) are already reported by infer_ai_surfaces.
+AGENT_FRAMEWORK_SIGNATURES = (
+    ("Google A2A", ("/.well-known/agent.json", "/.well-known/agent-card.json", "/a2a")),
+    ("Model Context Protocol", ("/mcp", "/sse", "/jsonrpc")),
+    ("LangGraph", ("/threads", "/runs", "/assistants")),
+    ("CrewAI", ("/crew", "/kickoff")),
+    ("OpenAI Swarm", ("/swarm", "/handoff")),
+)
+
+
+def infer_agent_profile(llm_enum: Dict[str, Any]) -> Dict[str, Any]:
+    """Infer the agent's role, architecture, and capabilities from its route names.
+
+    Returns {"role", "architecture", "framework", "capabilities": [...],
+    "evidence": {cap: [paths]}} or {} if nothing recognisable.
+
+    - role         fine-grained label (most security-relevant capability wins)
+    - architecture topology bucket: multi-agent / tool-server / vector-store / rag /
+                   single-agent / unknown (the KB/RAG-vs-Single-vs-Multi taxonomy)
+    - framework    orchestration framework if a path fingerprint matches (A2A/MCP/...)
+
+    code-execution, tool-calling, mcp-tooling and multi-agent orchestration are the
+    highest-impact (agency, injection-to-action, cross-agent trust)."""
+    paths = set()
+    for ep in llm_enum.get("endpoints", []):
+        if isinstance(ep, dict) and ep.get("path"):
+            paths.add(str(ep["path"]).lower())
+    for hit in llm_enum.get("probe_hits", []):
+        if isinstance(hit, dict) and hit.get("path"):
+            paths.add(str(hit["path"]).lower())
+    if not paths:
+        return {}
+
+    evidence = {}
+    for cap, signs in AGENT_CAPABILITY_SIGNATURES.items():
+        matched = sorted({p for p in paths if any(s in p for s in signs)})
+        if matched:
+            evidence[cap] = matched[:5]
+    if not evidence:
+        return {}
+
+    role = "AI agent / service"
+    for cap, label in AGENT_ROLE_PRIORITY:
+        if cap in evidence:
+            role = label
+            break
+
+    architecture = "unknown"
+    for arch, caps in AGENT_ARCHITECTURE_RULES:
+        if any(cap in evidence for cap in caps):
+            architecture = arch
+            break
+
+    framework = ""
+    for name, signs in AGENT_FRAMEWORK_SIGNATURES:
+        if any(any(s in p for p in paths) for s in signs):
+            framework = name
+            break
+
+    # A recognised orchestration framework implies at least a multi-agent / tool-server
+    # topology even when the generic capability routes alone didn't reveal it
+    # (e.g. LangGraph's /threads,/runs,/assistants).
+    if framework and architecture in ("unknown", "single-agent"):
+        architecture = "tool-server" if framework == "Model Context Protocol" else "multi-agent"
+
+    # Capabilities ordered by the same priority for stable, meaningful display.
+    ordered_caps = [cap for cap, _ in AGENT_ROLE_PRIORITY if cap in evidence]
+    return {
+        "role": role,
+        "architecture": architecture,
+        "framework": framework,
+        "capabilities": ordered_caps,
+        "evidence": evidence,
+    }
+
+
+# Read-only vector-store / RAG collection enumeration. The AI-red-team "plaintext
+# first" rule: an exposed, UNAUTHENTICATED vector DB usually lets you read the
+# source chunks directly (no embedding inversion needed) - the highest-value RAG
+# win. Each entry is (engine, GET listing path). We send no auth, so a 200 with a
+# parseable listing means unauthenticated read access.
+VECTOR_STORE_LISTINGS = (
+    ("Qdrant", "/collections"),
+    ("Chroma", "/api/v2/tenants/default_tenant/databases/default_database/collections"),
+    ("Chroma", "/api/v1/collections"),
+    ("Weaviate", "/v1/schema"),
+    ("Elasticsearch/OpenSearch", "/_aliases"),
+)
+
+
+def _extract_collection_names(engine: str, payload: Any) -> Optional[List[str]]:
+    """Pull collection/class/index names from a vector-store listing response.
+
+    Returns a list (possibly empty = reachable but no collections) if the payload
+    matches this engine's shape, or None if it doesn't (so we keep trying)."""
+    try:
+        if engine == "Qdrant":
+            cols = payload.get("result", {}).get("collections")
+            if isinstance(cols, list):
+                return [c.get("name") for c in cols if isinstance(c, dict) and c.get("name")]
+        elif engine == "Chroma":
+            if isinstance(payload, list):
+                return [c.get("name") for c in payload if isinstance(c, dict) and c.get("name")]
+        elif engine == "Weaviate":
+            classes = payload.get("classes")
+            if isinstance(classes, list):
+                return [c.get("class") for c in classes if isinstance(c, dict) and c.get("class")]
+        elif engine == "Elasticsearch/OpenSearch":
+            if isinstance(payload, dict):
+                return [name for name in payload.keys() if not str(name).startswith(".")]
+    except AttributeError:
+        return None
+    return None
+
+
+def enumerate_vector_store(base_url: str) -> Dict[str, Any]:
+    """Read-only: list collections/classes/indices from an exposed vector store.
+
+    Returns {"engine","url","collections":[...],"collection_count","unauthenticated"}
+    or {} if no known vector-store listing is reachable. GET-only; no writes."""
+    for engine, path in VECTOR_STORE_LISTINGS:
+        response = http_request(f"{base_url}{path}")
+        if not response.get("ok") or response.get("json") is None:
+            continue
+        names = _extract_collection_names(engine, response["json"])
+        if names is None:
+            continue
+        return {
+            "engine": engine,
+            "url": f"{base_url}{path}",
+            "collections": [n for n in names if n][:50],
+            "collection_count": len(names),
+            "unauthenticated": True,
+        }
+    return {}
+
+
+# Active (opt-in) MCP/A2A capability confirmation. This is still read-only - it
+# fetches agent-discovery documents and sends the standard MCP JSON-RPC
+# initialize / tools/list handshake to turn *inferred* capabilities into a
+# *confirmed* tool inventory. It never invokes a tool. Categories mirror the
+# AI-red-team MCP triage (fs / exec / net / db / secrets / source-control).
+MCP_TOOL_CATEGORIES = {
+    "filesystem-read": ("read_file", "readfile", "cat ", "filesystem", "file read", "list_dir", "read_document", "list_files"),
+    "filesystem-write": ("write_file", "writefile", "edit_file", "file write", "create_file", "delete_file"),
+    "code-execution": ("shell", "command", "execute", "subprocess", "terminal", "python", "run_code", "run_command", "eval", "exec"),
+    "network-egress": ("fetch", "http", "url", "request", "browser", "curl", "webhook"),
+    "database-read": ("select", "query", "database", "sql", "schema", "table"),
+    "database-write": ("insert", "update", "delete", "drop", "execute sql", "write sql"),
+    "source-control": ("git", "github", "gitlab", "repository", "commit", "snippet"),
+    "secrets/identity": ("secret", "token", "credential", "identity", "vault", "password", "api_key", "rotate"),
+}
+
+
+def classify_mcp_tool(tool: Dict[str, Any]) -> List[str]:
+    text = f"{tool.get('name', '')} {tool.get('description', '')}".lower()
+    return [category for category, terms in MCP_TOOL_CATEGORIES.items() if any(term in text for term in terms)]
+
+
+def _parse_jsonrpc_body(response: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return the JSON-RPC object from an MCP response that may be JSON or SSE."""
+    if isinstance(response.get("json"), dict):
+        return response["json"]
+    obj = None
+    for line in (response.get("text") or "").splitlines():
+        line = line.strip()
+        if line.startswith("data:"):
+            try:
+                obj = json.loads(line[5:].strip())
+            except json.JSONDecodeError:
+                continue
+    return obj if isinstance(obj, dict) else None
+
+
+def enumerate_mcp_tools(base_url: str, mcp_path: str = "/mcp") -> Dict[str, Any]:
+    """Read-only MCP capability confirmation via JSON-RPC initialize + tools/list.
+
+    Returns {"path","url","tools":[{name,description,categories}],"tool_count"}
+    or {} if no tool list is recovered. Never invokes a tool."""
+    url = f"{base_url}{mcp_path}"
+    accept = {"Accept": "application/json, text/event-stream"}
+    initialize = http_request(url, method="POST", extra_headers=accept, payload={
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-03-26", "capabilities": {},
+                   "clientInfo": {"name": "one-shot-enum", "version": "1.0"}},
+    })
+    if initialize.get("status") is None or initialize.get("status") >= 500:
+        return {}
+    session = (initialize.get("headers") or {}).get("Mcp-Session-Id") \
+        or (initialize.get("headers") or {}).get("mcp-session-id")
+    list_headers = dict(accept)
+    if session:
+        list_headers["Mcp-Session-Id"] = session
+    listing = http_request(url, method="POST", extra_headers=list_headers, payload={
+        "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+
+    body = _parse_jsonrpc_body(listing)
+    tools: List[Dict[str, Any]] = []
+    if isinstance(body, dict):
+        result = body.get("result") if isinstance(body.get("result"), dict) else body
+        raw_tools = result.get("tools") if isinstance(result, dict) else None
+        if isinstance(raw_tools, list):
+            for tool in raw_tools:
+                if isinstance(tool, dict) and tool.get("name"):
+                    tools.append({
+                        "name": tool.get("name"),
+                        "description": tool.get("description", ""),
+                        "categories": classify_mcp_tool(tool),
+                    })
+    if not tools:
+        return {}
+    return {"path": mcp_path, "url": url, "tools": tools[:50], "tool_count": len(tools)}
+
+
+AGENT_CARD_PATHS = (
+    "/.well-known/agent.json",
+    "/.well-known/agent-card.json",
+    "/agent.json",
+    "/agent-card.json",
+    "/agents",
+    "/api/agents",
+)
+
+
+def fetch_agent_cards(base_url: str) -> List[Dict[str, Any]]:
+    """Read-only: fetch A2A / agent-discovery documents that advertise capabilities,
+    endpoints, and (crucially) whether a self-service registration route exists."""
+    cards: List[Dict[str, Any]] = []
+    for path in AGENT_CARD_PATHS:
+        response = http_request(f"{base_url}{path}")
+        if response.get("ok") and response.get("json") is not None:
+            cards.append({"path": path, "card": response["json"]})
+    return cards
 
 
 AI_SURFACE_NEXT_STEPS = {
@@ -951,6 +1272,12 @@ AI_SURFACE_NEXT_STEPS = {
         "Identify model flavors and unsafe loaders such as pickle, pyfunc, joblib, or torch.",
         "If write access exists, follow the artifact consumer before testing model/package tampering.",
     ],
+    "object-store": [
+        "List buckets anonymously (read-only): aws s3 ls --no-sign-request --endpoint-url http://HOST:9000 (or mc alias set + mc ls).",
+        "Recurse buckets for model artifacts (.pkl/.joblib/.pt/.bin/.h5/.onnx), .env, and credential/config files.",
+        "Check for write access before anything else - a writable bucket is artifact/model tampering.",
+        "If it backs MLflow, a writable artifact store is a pickle/joblib deserialization path to code execution on the model consumer.",
+    ],
     "model-serving": [
         "List loaded models and versions.",
         "Check health/readiness plus metrics for model names, paths, and backend framework.",
@@ -1007,7 +1334,8 @@ def truncate_text(value: str, limit: int = MAX_RESPONSE_CHARS) -> str:
 def http_request(url: str,
                  method: str = "GET",
                  payload: Optional[Dict[str, Any]] = None,
-                 timeout: int = HTTP_TIMEOUT_SECONDS) -> Dict[str, Any]:
+                 timeout: int = HTTP_TIMEOUT_SECONDS,
+                 extra_headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     data = None
     headers = {
         "Accept": "application/json, text/plain;q=0.9, */*;q=0.8",
@@ -1017,18 +1345,24 @@ def http_request(url: str,
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"
+    if extra_headers:
+        headers.update(extra_headers)
 
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
 
+    response_headers: Dict[str, str] = {}
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             body_bytes = response.read()
             status = response.getcode()
             content_type = response.headers.get("Content-Type", "")
+            response_headers = {k: v for k, v in response.headers.items()}
     except urllib.error.HTTPError as exc:
         body_bytes = exc.read()
         status = exc.code
         content_type = exc.headers.get("Content-Type", "") if exc.headers else ""
+        if exc.headers:
+            response_headers = {k: v for k, v in exc.headers.items()}
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         return {
             "ok": False,
@@ -1036,6 +1370,7 @@ def http_request(url: str,
             "content_type": "",
             "text": "",
             "json": None,
+            "headers": {},
             "error": str(exc),
         }
 
@@ -1052,6 +1387,7 @@ def http_request(url: str,
         "content_type": content_type,
         "text": text,
         "json": parsed_json,
+        "headers": response_headers,
         "error": "",
     }
 
@@ -1086,7 +1422,10 @@ def is_interesting_probe_response(response: Dict[str, Any]) -> bool:
     status = response.get("status")
     if status is None:
         return False
-    return 200 <= status < 400 or status in (401, 403, 405)
+    # 400/422 catch custom FastAPI/Starlette agents that reject a GET on a
+    # body-required POST route with "Bad Request"/"Unprocessable Entity" rather
+    # than 404 - the route (and the surface) exists.
+    return 200 <= status < 400 or status in (400, 401, 403, 405, 422)
 
 
 def probe_llm_paths(base_url: str) -> List[Dict[str, Any]]:
@@ -1280,6 +1619,13 @@ def infer_ai_surfaces(service: Service, llm_enum: Dict[str, Any]) -> List[Dict[s
     if _path_contains(paths, "mlflow") or "mlflow" in banner or "mlflow" in preview:
         _add_ai_surface(surfaces, "mlflow", "MLflow tracking/model registry", "high", ["MLflow API endpoint or marker exposed"])
 
+    # Object store (MinIO / S3-compatible): the artifact-store sink behind MLflow/ML
+    # pipelines - model artifacts, training data, and often its own credentials.
+    if _path_matches(paths, ("/minio/health/live", "/minio/health/ready", "/minio/health/cluster")) or "minio" in banner or "minio" in preview:
+        _add_ai_surface(surfaces, "object-store", "MinIO / S3-compatible object store", "high", ["MinIO health endpoint or marker exposed"])
+    elif "listallmybucketsresult" in preview or "amazons3" in banner or "amazon s3" in banner:
+        _add_ai_surface(surfaces, "object-store", "S3-compatible object store", "medium", ["S3-style API response detected"])
+
     if _path_matches(paths, ("/v2/models", "/v2/health/live", "/v2/health/ready")):
         _add_ai_surface(surfaces, "model-serving", "Triton-style model serving API", "medium", ["Triton-style /v2 model-serving endpoint exposed"])
     elif _path_matches(paths, ("/models", "/predictions")) and _path_matches(paths, ("/ping", "/invocations", "/predict")):
@@ -1308,9 +1654,11 @@ def infer_ai_surfaces(service: Service, llm_enum: Dict[str, Any]) -> List[Dict[s
 
 def ai_surface_lines(llm_enum: Dict[str, Any]) -> List[str]:
     surfaces = llm_enum.get("ai_surfaces", [])
+    profile = llm_enum.get("agent_profile") or {}
     ai_paths_mode = bool(llm_enum.get("ai_paths_mode"))
     header = bold("AI attack pathfinder:", C.CYAN)
-    if not surfaces:
+
+    if not surfaces and not profile:
         if ai_paths_mode:
             return [
                 header,
@@ -1319,8 +1667,64 @@ def ai_surface_lines(llm_enum: Dict[str, Any]) -> List[str]:
             ]
         return []
 
-    conf_colors = {"high": C.BOLD + C.RED, "medium": C.BOLD + C.YELLOW, "low": C.GREY}
     lines = [header]
+
+    # Inferred agent role + architecture + capabilities (from endpoint/route names).
+    if profile:
+        lines.append(f"  {bold('Agent profile:', C.CYAN)} {bold(profile.get('role', 'AI agent'), C.RED)}")
+        arch = profile.get("architecture")
+        framework = profile.get("framework")
+        if arch and arch != "unknown":
+            arch_labels = {
+                "multi-agent": "Multi-agent / A2A system",
+                "tool-server": "Tool server (MCP)",
+                "vector-store": "Embedding / vector store",
+                "rag": "RAG / knowledge-base pipeline",
+                "single-agent": "Single agent",
+            }
+            arch_str = arch_labels.get(arch, arch)
+            if framework:
+                arch_str = f"{arch_str} - {framework}"
+            lines.append(f"    {bold('Architecture:', C.CYAN)} {arch_str}")
+        caps = profile.get("capabilities", [])
+        if caps:
+            dangerous = {"code-execution", "tool-calling", "mcp-tooling", "orchestration", "agent-discovery"}
+            cap_str = ", ".join(color(c, C.BOLD + C.RED) if c in dangerous else c for c in caps)
+            lines.append(f"    Capabilities: {cap_str}")
+        signals = [paths[0] for paths in (profile.get("evidence", {}).get(c) for c in caps) if paths]
+        if signals:
+            lines.append(f"    {color('Signals:', C.GREY)} {', '.join(dict.fromkeys(signals))}")
+
+    # Unauthenticated vector store = read the source chunks directly (plaintext first).
+    vstore = llm_enum.get("vector_store") or {}
+    if vstore.get("collections") is not None and vstore.get("unauthenticated"):
+        count = vstore.get("collection_count", 0)
+        lines.append(f"  {bold('Unauthenticated vector store:', C.RED)} {vstore.get('engine')} - {count} collection(s)")
+        cols = vstore.get("collections") or []
+        if cols:
+            shown = ", ".join(cols[:8]) + (" ..." if len(cols) > 8 else "")
+            lines.append(f"    {color('Collections:', C.GREY)} {shown}")
+        lines.append(f"    {bold('Next:', C.YELLOW)} dump payloads read-only and grep for secrets/hosts/paths before any inversion ({vstore.get('url')}).")
+
+    # Confirmed MCP tool inventory (--ai-active): inferred capability -> real tools.
+    mcp_tools = llm_enum.get("mcp_tools") or {}
+    if mcp_tools.get("tools"):
+        lines.append(f"  {bold('Confirmed MCP tools:', C.RED)} {mcp_tools.get('tool_count')} via {mcp_tools.get('path')}")
+        dangerous_cat = {"code-execution", "filesystem-write", "database-write", "secrets/identity"}
+        for tool in mcp_tools["tools"][:12]:
+            cats = tool.get("categories") or []
+            cat_str = ", ".join(color(c, C.BOLD + C.RED) if c in dangerous_cat else c for c in cats)
+            suffix = f"  [{cat_str}]" if cats else ""
+            lines.append(f"    {color('-', C.GREY)} {tool.get('name')}{suffix}")
+
+    # Confirmed A2A / agent-discovery documents (--ai-active).
+    cards = llm_enum.get("agent_cards") or []
+    if cards:
+        card_paths = ", ".join(dict.fromkeys(c.get("path") for c in cards))
+        lines.append(f"  {bold('Agent-discovery documents:', C.RED)} {card_paths}")
+        lines.append(f"    {bold('Next:', C.YELLOW)} record advertised capabilities/endpoints; test for a self-service registration route (rogue-agent risk).")
+
+    conf_colors = {"high": C.BOLD + C.RED, "medium": C.BOLD + C.YELLOW, "low": C.GREY}
     for surface in surfaces:
         confidence = str(surface.get("confidence", "")).lower()
         conf_str = color(f"{surface['confidence']} confidence", conf_colors.get(confidence, C.GREY))
@@ -1349,7 +1753,8 @@ def apply_openapi_response(result: Dict[str, Any], response: Dict[str, Any], url
 def enumerate_llm_service(target: str,
                           service: Service,
                           endpoint_only: bool = False,
-                          ai_paths_mode: bool = False) -> Dict[str, Any]:
+                          ai_paths_mode: bool = False,
+                          active: bool = False) -> Dict[str, Any]:
     base_url = service_base_url(target, service)
     openapi_url = f"{base_url}{OPENAPI_CANDIDATE_PATHS[0]}"
     openapi_response = http_request(openapi_url)
@@ -1365,6 +1770,10 @@ def enumerate_llm_service(target: str,
         "probe_count": len(LLM_PROBE_PATHS),
         "probe_hits": [],
         "ai_surfaces": [],
+        "agent_profile": {},
+        "vector_store": {},
+        "mcp_tools": {},
+        "agent_cards": [],
         "chat_path": "",
     }
 
@@ -1380,10 +1789,31 @@ def enumerate_llm_service(target: str,
 
     if endpoint_only:
         result["ai_surfaces"] = infer_ai_surfaces(service, result)
+        result["agent_profile"] = infer_agent_profile(result)
         return result
 
     result["probe_hits"] = probe_llm_paths(base_url)
     result["ai_surfaces"] = infer_ai_surfaces(service, result)
+    result["agent_profile"] = infer_agent_profile(result)
+
+    # "Plaintext first": if this looks like a vector store, try to list its
+    # collections read-only. An unauthenticated listing is the highest-value RAG win.
+    surface_keys = {s.get("key") for s in result["ai_surfaces"] if isinstance(s, dict)}
+    architecture = result["agent_profile"].get("architecture")
+    if architecture == "vector-store" or "rag-vector" in surface_keys:
+        result["vector_store"] = enumerate_vector_store(base_url)
+
+    # Active (opt-in) confirmation: turn inferred MCP/A2A capability into a real
+    # tool inventory / agent-card list. Still read-only (initialize + tools/list,
+    # GET agent cards); gated on --ai-active so it never runs by default.
+    if active:
+        probe_paths = {str(hit.get("path", "")).lower() for hit in result["probe_hits"]}
+        if architecture == "tool-server" or "agent-mcp" in surface_keys \
+                or any(p in probe_paths for p in ("/mcp", "/mcp/", "/sse")):
+            result["mcp_tools"] = enumerate_mcp_tools(base_url)
+        if architecture == "multi-agent" \
+                or any(p in probe_paths for p in ("/.well-known/agent.json", "/agents", "/a2a")):
+            result["agent_cards"] = fetch_agent_cards(base_url)
 
     # Record whether a chat/completions endpoint exists, across common stacks
     # (/chat, Ollama /api/chat, OpenAI /v1/chat/completions, ...). Enumeration
@@ -1406,7 +1836,8 @@ def run_llm_enumeration(target: str,
                         tcp_services: List[Service],
                         endpoint_only: bool = False,
                         probe_all_http: bool = False,
-                        ai_paths_mode: bool = False) -> None:
+                        ai_paths_mode: bool = False,
+                        active: bool = False) -> None:
     for service in tcp_services:
         if not resembles_llm_service(service) and not (probe_all_http and is_http_like_service(service)):
             continue
@@ -1419,6 +1850,7 @@ def run_llm_enumeration(target: str,
             service,
             endpoint_only=endpoint_only,
             ai_paths_mode=ai_paths_mode,
+            active=active,
         )
 
 
@@ -1915,6 +2347,12 @@ PATHFINDER_SCAN_CMD = "python3 -m main.pathfinder scan"
 PER_HOST_LANE = 2
 # Kill a tool that produces no output for this many seconds (a hang); 0 disables.
 DEFAULT_RUN_IDLE_TIMEOUT = 180
+# Wall-clock ceiling (seconds) for a single nmap invocation, so one filtered/slow
+# host on a -p- / -sU sweep can't pin a worker forever (--run-timeout only covers
+# the recon tools, not nmap). 0 disables. Set from --scan-timeout in main();
+# run_nmap_with_progress reads this global at call time.
+DEFAULT_SCAN_TIMEOUT = 1800
+NMAP_SCAN_TIMEOUT = DEFAULT_SCAN_TIMEOUT
 
 # OSCP exam profile: suggestion tools restricted on the exam, omitted under --oscp.
 # (Metasploit isn't suggested here; PathFinder handles its one-target reminder.)
@@ -1927,6 +2365,7 @@ SMB_PORTS = {139, 445}
 LDAP_PORTS = {389, 636, 3268, 3269}
 KERBEROS_PORTS = {88}
 SNMP_PORTS = {161}
+NFS_PORTS = {111, 2049}
 
 DOMAIN_PLACEHOLDER = "<domain>"
 USER_PLACEHOLDER = "<user>"
@@ -1942,12 +2381,37 @@ def host_loot_dir(loot: str, host: str) -> str:
     return f"{loot}/{safe_name(host)}"
 
 
+def warn_stale_loot(loot: str, targets: List[str]) -> None:
+    """Warn if the loot dir already holds host subdirs that aren't in this run's
+    target set. PathFinder analyses the whole loot tree, so leftover host dirs from a
+    previous engagement would be synthesised alongside the current data. We only
+    warn (never delete) - clearing another engagement's loot is the operator's call.
+    """
+    root = Path(loot)
+    if not root.is_dir():
+        return
+    expected = {safe_name(t) for t in targets}
+    try:
+        stale = sorted(
+            entry.name for entry in root.iterdir()
+            if entry.is_dir() and not entry.name.startswith("_") and entry.name not in expected
+        )
+    except OSError:
+        return
+    if stale:
+        warn(f"Loot dir '{loot}/' already contains host data not in this run: {', '.join(stale)}.")
+        warn("PathFinder analyses the whole loot dir; move/clear stale hosts or pass "
+             "--loot-dir <fresh> to avoid mixing engagements.")
+
+
 def write_llm_enum_loot(host: str, service: Service, loot: str) -> Optional[Path]:
     """Write a service's LLM/AI surface enumeration into the loot dir as a
     PathFinder-consumable JSON so PathFinder's AI/LLM rules can synthesise attack
     paths from it. Returns the written path, or None if there's nothing to emit."""
     llm_enum = service.get("llm_enum")
-    if not isinstance(llm_enum, dict) or not llm_enum.get("ai_surfaces"):
+    # Hand off if we recognised a framework surface OR inferred an agent role
+    # (custom agents often match no framework fingerprint but are clearly AI).
+    if not isinstance(llm_enum, dict) or not (llm_enum.get("ai_surfaces") or llm_enum.get("agent_profile")):
         return None
     try:
         port_int = int(service.get("port"))
@@ -1981,6 +2445,10 @@ def write_llm_enum_loot(host: str, service: Service, loot: str) -> Optional[Path
             for hit in llm_enum.get("probe_hits", []) if isinstance(hit, dict)
         ],
         "chat_path": llm_enum.get("chat_path", ""),
+        "agent_profile": llm_enum.get("agent_profile") or {},
+        "vector_store": llm_enum.get("vector_store") or {},
+        "mcp_tools": llm_enum.get("mcp_tools") or {},
+        "agent_cards": llm_enum.get("agent_cards") or [],
         "ai_surfaces": [
             {"key": s.get("key"), "label": s.get("label"),
              "confidence": s.get("confidence"), "evidence": s.get("evidence", []),
@@ -2036,28 +2504,35 @@ def _looks_wordpress(service: Service) -> bool:
     return "wordpress" in blob or "wp-content" in blob
 
 
+def _lootpath(loot: str, name: str) -> str:
+    """A shlex-quoted loot file/dir path, so a --loot-dir with spaces or shell
+    metacharacters can't break the generated bash command or the recon script."""
+    return shlex.quote(f"{loot}/{name}")
+
+
 def _web_suggestions(host: str, service: Service, loot: str, wordlist: str) -> List[Dict[str, Any]]:
     scheme = _web_scheme(service)
     port = _svc_port(service)
     base = f"{scheme}://{host}:{port}"
     group = f"web {scheme}:{port}"
     k = " -k" if scheme == "https" else ""
+    wl = shlex.quote(wordlist)
     out = [
         _suggestion(host, group, "whatweb",
-                    f"whatweb -a3 {base} --log-json={loot}/whatweb_{port}.json", "whatweb_json"),
+                    f"whatweb -a3 {base} --log-json={_lootpath(loot, f'whatweb_{port}.json')}", "whatweb_json"),
         _suggestion(host, group, "gobuster",
-                    f"gobuster dir -u {base} -w {wordlist}{k} -o {loot}/gobuster_{port}.txt", "gobuster_txt"),
+                    f"gobuster dir -u {base} -w {wl}{k} -o {_lootpath(loot, f'gobuster_{port}.txt')}", "gobuster_txt"),
         _suggestion(host, group, "ffuf",
-                    f"ffuf -u {base}/FUZZ -w {wordlist}{k} -of json -o {loot}/ffuf_{port}.json",
+                    f"ffuf -u {base}/FUZZ -w {wl}{k} -of json -o {_lootpath(loot, f'ffuf_{port}.json')}",
                     "ffuf_json"),
         _suggestion(host, group, "nikto",
-                    f"nikto -h {base} -Format json -o {loot}/nikto_{port}.json", "nikto_json"),
+                    f"nikto -h {base} -Format json -o {_lootpath(loot, f'nikto_{port}.json')}", "nikto_json"),
         _suggestion(host, group, "nuclei",
-                    f"nuclei -u {base} -jsonl -o {loot}/nuclei_{port}.jsonl", "nuclei_jsonl"),
+                    f"nuclei -u {base} -jsonl -o {_lootpath(loot, f'nuclei_{port}.jsonl')}", "nuclei_jsonl"),
     ]
     if _looks_wordpress(service):
         out.append(_suggestion(host, group, "wpscan",
-                   f"wpscan --url {base} --format json -o {loot}/wpscan_{port}.json --disable-tls-checks",
+                   f"wpscan --url {base} --format json -o {_lootpath(loot, f'wpscan_{port}.json')} --disable-tls-checks",
                    "wpscan_json"))
     return out
 
@@ -2066,42 +2541,55 @@ def _smb_suggestions(host: str, loot: str) -> List[Dict[str, Any]]:
     tag = safe_name(host)
     return [
         _suggestion(host, "smb", "enum4linux-ng",
-                    f"enum4linux-ng -A -oJ {loot}/enum4linux_{tag} {host}", "enum4linux_json"),
+                    f"enum4linux-ng -A -oJ {_lootpath(loot, f'enum4linux_{tag}')} {host}", "enum4linux_json"),
+        # tee (not >) so stdout still flows through the pipe the --run idle-timeout
+        # watches; a plain redirect leaves the pipe silent and can get the tool killed.
         _suggestion(host, "smb", "smbmap",
-                    f"smbmap -H {host} -u guest -p '' > {loot}/smbmap_{tag}.txt", "smbmap_txt"),
+                    f"smbmap -H {host} -u guest -p '' | tee {_lootpath(loot, f'smbmap_{tag}.txt')}", "smbmap_txt"),
         _suggestion(host, "smb", "netexec",
-                    f"nxc smb {host} --shares --users --log {loot}/nxc_{tag}.log",
+                    f"nxc smb {host} --shares --users --log {_lootpath(loot, f'nxc_{tag}.log')}",
                     "netexec_log"),
     ]
 
 
 def _snmp_suggestions(host: str, loot: str) -> List[Dict[str, Any]]:
     return [
+        # tee (not >) so the --run idle-timeout sees output on the pipe; snmp-check
+        # can walk a large MIB silently on stdout and would otherwise look hung.
         _suggestion(host, "snmp", "snmp-check",
-                    f"snmp-check {host} -c public > {loot}/snmp_{safe_name(host)}.txt", "snmp_txt"),
+                    f"snmp-check {host} -c public | tee {_lootpath(loot, f'snmp_{safe_name(host)}.txt')}", "snmp_txt"),
+    ]
+
+
+def _nfs_suggestions(host: str, loot: str) -> List[Dict[str, Any]]:
+    tag = safe_name(host)
+    return [
+        _suggestion(host, "nfs", "showmount",
+                    f"showmount -e {host} | tee {_lootpath(loot, f'nfs_{tag}.txt')}", "nfs_txt"),
     ]
 
 
 def _ad_suggestions(host: str, loot: str, userlist: str) -> List[Dict[str, Any]]:
     dom, user, pw = DOMAIN_PLACEHOLDER, USER_PLACEHOLDER, PASS_PLACEHOLDER
+    ul = shlex.quote(userlist)
     return [
         _suggestion(host, "ad kerberos", "kerbrute",
-                    f"kerbrute userenum -d {dom} --dc {host} {userlist} -o {loot}/kerbrute.txt",
+                    f"kerbrute userenum -d {dom} --dc {host} {ul} -o {_lootpath(loot, 'kerbrute.txt')}",
                     "kerbrute_txt"),
         _suggestion(host, "ad kerberos", "impacket-GetNPUsers",
-                    f"impacket-GetNPUsers {dom}/ -dc-ip {host} -usersfile {userlist} "
-                    f"-format hashcat -outputfile {loot}/getnpusers.txt", "getnpusers_hashes"),
+                    f"impacket-GetNPUsers {dom}/ -dc-ip {host} -usersfile {ul} "
+                    f"-format hashcat -outputfile {_lootpath(loot, 'getnpusers.txt')}", "getnpusers_hashes"),
         _suggestion(host, "ad (needs creds)", "ldapdomaindump",
-                    f"ldapdomaindump -u '{dom}\\{user}' -p '{pw}' {host} -o {loot}/ldap/",
+                    f"ldapdomaindump -u '{dom}\\{user}' -p '{pw}' {host} -o {_lootpath(loot, 'ldap/')}",
                     "ldapdomaindump_dir", gated=True),
         _suggestion(host, "ad (needs creds)", "impacket-GetUserSPNs",
                     f"impacket-GetUserSPNs {dom}/{user}:{pw} -dc-ip {host} -request "
-                    f"-outputfile {loot}/getuserspns.txt", "getuserspns_hashes", gated=True),
+                    f"-outputfile {_lootpath(loot, 'getuserspns.txt')}", "getuserspns_hashes", gated=True),
         _suggestion(host, "ad (needs creds)", "certipy",
-                    f"certipy find -u {user}@{dom} -p '{pw}' -dc-ip {host} -json -output {loot}/certipy",
+                    f"certipy find -u {user}@{dom} -p '{pw}' -dc-ip {host} -json -output {_lootpath(loot, 'certipy')}",
                     "certipy_json", gated=True),
         _suggestion(host, "ad (needs creds)", "impacket-secretsdump",
-                    f"impacket-secretsdump {dom}/{user}:{pw}@{host} | tee {loot}/secretsdump.txt",
+                    f"impacket-secretsdump {dom}/{user}:{pw}@{host} | tee {_lootpath(loot, 'secretsdump.txt')}",
                     "secretsdump_txt", gated=True),
     ]
 
@@ -2110,7 +2598,7 @@ def _post_foothold_suggestions(host: str, loot: str) -> List[Dict[str, Any]]:
     tag = safe_name(host)
     return [
         _suggestion(host, "post-foothold (linux)", "linpeas",
-                    f"./linpeas.sh | tee {loot}/linpeas_{tag}.txt", "linpeas_txt", gated=True),
+                    f"./linpeas.sh | tee {_lootpath(loot, f'linpeas_{tag}.txt')}", "linpeas_txt", gated=True),
         _suggestion(host, "post-foothold (windows)", "winpeas",
                     f".\\winPEASany.exe > {loot}\\winpeas_{tag}.txt", "winpeas_txt",
                     gated=True, shell="powershell"),
@@ -2131,6 +2619,7 @@ def suggest_for_host(host: str,
     has_smb = False
     has_ad = False
     has_snmp = False
+    has_nfs = False
 
     # Per-host loot subdirectory so PathFinder attributes every file to this host
     # and files from different hosts never collide.
@@ -2145,15 +2634,23 @@ def suggest_for_host(host: str,
         if "ldap" in _svc_name(service) or "kerberos" in _svc_name(service) \
                 or port in LDAP_PORTS or port in KERBEROS_PORTS:
             has_ad = True
+        if "nfs" in _svc_name(service) or "mountd" in _svc_name(service) or "rpcbind" in _svc_name(service) \
+                or port in NFS_PORTS:
+            has_nfs = True
 
     for service in list(udp_services) + list(tcp_services):
         if "snmp" in _svc_name(service) or _svc_port(service) in SNMP_PORTS:
             has_snmp = True
+        if "nfs" in _svc_name(service) or "mountd" in _svc_name(service) or "rpcbind" in _svc_name(service) \
+                or _svc_port(service) in NFS_PORTS:
+            has_nfs = True
 
     if has_smb:
         suggestions.extend(_smb_suggestions(host, host_loot))
     if has_snmp:
         suggestions.extend(_snmp_suggestions(host, host_loot))
+    if has_nfs:
+        suggestions.extend(_nfs_suggestions(host, host_loot))
     if has_ad:
         suggestions.extend(_ad_suggestions(host, host_loot, userlist))
     suggestions.extend(_post_foothold_suggestions(host, host_loot))
@@ -2233,7 +2730,7 @@ def write_recon_scripts(outdir: Path,
         "# Generated by one-shot-enum --suggest. Review before running.",
         "# Live lines are unauthenticated recon; commented lines need creds/a foothold.",
         "set -u",
-        "mkdir -p " + " ".join(mkdir_targets),
+        "mkdir -p " + " ".join(shlex.quote(t) for t in mkdir_targets),
         "",
     ]
     ps_lines = [
@@ -2349,9 +2846,14 @@ def _terminate_process(proc) -> None:
 
 
 def _run_worker(job: Dict[str, Any], lock: threading.Lock, tty: bool) -> None:
-    job["state"] = "running"
-    job["start"] = time.time()
-    job["last_output"] = job["start"]
+    with lock:
+        if job.get("interrupted") or job.get("state") == "interrupted":
+            job["state"] = "interrupted"
+            job["end"] = time.time()
+            return
+        job["state"] = "running"
+        job["start"] = time.time()
+        job["last_output"] = job["start"]
     try:
         with open(job["logpath"], "w", encoding="utf-8", errors="replace") as logf:
             # shell=True so redirections (snmp-check > file) and quoting work.
@@ -2385,6 +2887,8 @@ def _run_worker(job: Dict[str, Any], lock: threading.Lock, tty: bool) -> None:
 
     if job.get("error"):
         job["state"] = "failed"
+    elif job.get("interrupted"):
+        job["state"] = "interrupted"
     elif job.get("timed_out"):
         job["state"] = "timed out"
     elif job.get("rc") == 0:
@@ -2435,7 +2939,7 @@ def run_suggestions(all_suggestions: List[Dict[str, Any]],
         job: Dict[str, Any] = {
             "tool": s["tool"], "host": s["host"], "command": s["command"],
             "state": "queued", "last": "", "rc": None, "start": None, "end": None,
-            "error": "", "proc": None, "timed_out": False, "last_output": None,
+            "error": "", "proc": None, "timed_out": False, "interrupted": False, "last_output": None,
             "logpath": str(logs_dir / f"{safe_name(s['tool'])}_{safe_name(s['host'])}_{idx}.log"),
         }
         if shutil.which(binary) is None:
@@ -2465,7 +2969,7 @@ def run_suggestions(all_suggestions: List[Dict[str, Any]],
         running = sum(1 for j in jobs if j["state"] == "running")
         done = sum(1 for j in jobs if j["state"] == "done")
         skipped = sum(1 for j in jobs if j["state"].startswith("skip"))
-        other = sum(1 for j in jobs if j["state"] in ("failed", "timed out") or j["state"].startswith("exit"))
+        other = sum(1 for j in jobs if j["state"] in ("failed", "timed out", "interrupted") or j["state"].startswith("exit"))
         header = (f"Recon [{len(jobs_by_host)} host lane(s), {PER_HOST_LANE}/host]: "
                   f"{running} running, {done} done, {skipped} skipped, {other} other")
         lines = [color(header, C.BOLD)]
@@ -2500,6 +3004,7 @@ def run_suggestions(all_suggestions: List[Dict[str, Any]],
                 warn(f"[skip] {j['tool']} ({j['host']}): {j['state'].split(':', 1)[1]}")
 
     executors = []
+    interrupted = False
     try:
         for host, host_jobs in jobs_by_host.items():
             ex = ThreadPoolExecutor(max_workers=PER_HOST_LANE)
@@ -2513,6 +3018,21 @@ def run_suggestions(all_suggestions: List[Dict[str, Any]],
             renderer.render(build_lines())
             time.sleep(0.3)
         renderer.render(build_lines())
+    except KeyboardInterrupt:
+        interrupted = True
+        warn("Interrupted; terminating active recon tools before leaving the run.")
+        with lock:
+            active = [j for j in to_run if j["state"] == "running" and j.get("proc") is not None]
+            queued = [j for j in to_run if j["state"] == "queued"]
+            for j in active:
+                j["interrupted"] = True
+            for j in queued:
+                j["interrupted"] = True
+                j["state"] = "interrupted"
+                j["end"] = time.time()
+        for j in active:
+            _terminate_process(j["proc"])
+        renderer.render(build_lines())
     finally:
         for ex in executors:
             ex.shutdown(wait=True)
@@ -2522,12 +3042,16 @@ def run_suggestions(all_suggestions: List[Dict[str, Any]],
     nonzero = sum(1 for j in jobs if j["state"].startswith("exit"))
     failed = sum(1 for j in jobs if j["state"] == "failed")
     timed_out = sum(1 for j in jobs if j["state"] == "timed out")
+    interrupted_count = sum(1 for j in jobs if j["state"] == "interrupted")
 
     print()
     good(f"Recon complete: {ran} ran clean, {skipped} skipped, {nonzero} non-zero exit, "
-         f"{failed} failed, {timed_out} timed out")
+         f"{failed} failed, {timed_out} timed out, {interrupted_count} interrupted")
     good(f"Per-tool logs: {logs_dir}")
-    return {"ran": ran, "skipped": skipped, "nonzero": nonzero, "failed": failed, "timed_out": timed_out}
+    return {
+        "ran": ran, "skipped": skipped, "nonzero": nonzero, "failed": failed,
+        "timed_out": timed_out, "interrupted": interrupted_count if interrupted else 0,
+    }
 
 
 def run_pathfinder(pathfinder_path: str, loot: str, oscp: bool = False) -> None:
@@ -2598,6 +3122,18 @@ def parse_args() -> argparse.Namespace:
              "prioritized attack-path next steps, and (with --suggest/--run) hand surfaces to PathFinder",
     )
     parser.add_argument(
+        "--ai-only",
+        action="store_true",
+        help="With --suggest/--run, focus on AI surfaces only - hand the AI enumeration to PathFinder "
+             "and skip all other recon tool suggestions/runs (implies --ai-paths)",
+    )
+    parser.add_argument(
+        "--ai-active",
+        action="store_true",
+        help="Active (still read-only) AI confirmation: for MCP/A2A surfaces, fetch agent cards and send "
+             "the MCP initialize + tools/list handshake to confirm the real tool inventory (implies --ai-paths)",
+    )
+    parser.add_argument(
         "--timing",
         choices=["T1", "T2", "T3", "T4", "T5"],
         default="T4",
@@ -2638,14 +3174,33 @@ def parse_args() -> argparse.Namespace:
              f"(a hang); 0 disables (default: {DEFAULT_RUN_IDLE_TIMEOUT})",
     )
     parser.add_argument(
+        "--scan-timeout",
+        type=int,
+        default=DEFAULT_SCAN_TIMEOUT,
+        help=f"Wall-clock ceiling (seconds) for a single nmap invocation so one slow/"
+             f"filtered host can't hang the scan; 0 disables (default: {DEFAULT_SCAN_TIMEOUT})",
+    )
+    parser.add_argument(
+        "--loot-dir",
+        default=LOOT_DIR,
+        help=f"Directory for loot / PathFinder handoff (default: {LOOT_DIR}). Use a "
+             f"fresh dir per engagement so PathFinder never mixes current and stale data",
+    )
+    parser.add_argument(
         "--oscp",
         action="store_true",
         help="OSCP exam profile: omit restricted tools (" + ", ".join(sorted(OSCP_PROHIBITED_TOOLS)) +
              ") from suggestions/runs, and pass --oscp through to PathFinder",
     )
     args = parser.parse_args()
+    if args.ai_only:
+        args.ai_paths = True  # AI-only mode always runs the rich AI enumeration
+    if args.ai_active:
+        args.ai_paths = True  # active confirmation builds on the rich AI enumeration
     if args.run_timeout < 0:
         parser.error("--run-timeout must be >= 0.")
+    if args.scan_timeout < 0:
+        parser.error("--scan-timeout must be >= 0.")
     if args.suggest and args.run:
         parser.error("Use either --suggest or --run, not both.")
     if args.llm_endpoint and args.ai_paths:
@@ -2662,9 +3217,15 @@ def parse_args() -> argparse.Namespace:
 # =========================
 
 def main() -> None:
+    global NMAP_SCAN_TIMEOUT
     args = parse_args()
+    NMAP_SCAN_TIMEOUT = args.scan_timeout
     if args.no_color:
         set_color_mode(False)
+
+    # Loot directory (default "loot") is chosen once here and used for every handoff.
+    global LOOT_DIR
+    LOOT_DIR = args.loot_dir
 
     try:
         targets = normalize_targets(args.targets)
@@ -2681,6 +3242,10 @@ def main() -> None:
     if not targets:
         err("No valid targets supplied.")
         sys.exit(1)
+
+    # With a handoff to PathFinder, flag stale host data left in the loot dir.
+    if args.suggest or args.run:
+        warn_stale_loot(LOOT_DIR, targets)
 
     has_nmap = nmap_installed()
     use_local_fallback = not has_nmap and len(targets) == 1 and is_localhost_target(targets[0])
@@ -2732,6 +3297,8 @@ def main() -> None:
         info("LLM/API endpoint enum enabled (quick OpenAPI peek on matching services)")
     if args.ai_paths:
         info("AI attack pathfinder enabled for all HTTP-like services (surfaces handed to PathFinder with --suggest/--run)")
+    if args.ai_only:
+        info("AI-only mode: skipping all non-AI recon tool suggestions/runs")
     info(f"Save output: {'yes' if args.save else 'no'}")
     if args.save and base_outdir:
         info(f"Output directory: {base_outdir}")
@@ -2834,6 +3401,7 @@ def main() -> None:
                             endpoint_only=args.llm_endpoint,
                             probe_all_http=use_local_fallback or args.ai_paths,
                             ai_paths_mode=args.ai_paths,
+                            active=getattr(args, "ai_active", False),
                         )
                     except Exception as exc:
                         err(f"{target}: LLM/API enum failed: {exc}")
@@ -2860,23 +3428,25 @@ def main() -> None:
                     written_llm = write_llm_enum_loot(loot_host, svc, LOOT_DIR)
                     if written_llm:
                         good(f"AI surfaces -> {written_llm}")
-            host_suggestions = suggest_for_host(
-                loot_host, tcp_services, udp_services,
-                LOOT_DIR, DEFAULT_WEB_WORDLIST, DEFAULT_USER_WORDLIST,
-            )
-            if args.oscp:
-                # Drop tools restricted on the OSCP exam (record what we omitted).
-                kept = []
-                for s in host_suggestions:
-                    if s["tool"] in OSCP_PROHIBITED_TOOLS:
-                        oscp_omitted.add(s["tool"])
-                    else:
-                        kept.append(s)
-                host_suggestions = kept
-            if args.suggest:
-                # Use the same pinned host the loot paths are keyed on.
-                print_suggestions(loot_host, host_suggestions)
-            all_suggestions.extend(host_suggestions)
+            # --ai-only: skip all non-AI recon tool suggestions/runs entirely.
+            if not args.ai_only:
+                host_suggestions = suggest_for_host(
+                    loot_host, tcp_services, udp_services,
+                    LOOT_DIR, DEFAULT_WEB_WORDLIST, DEFAULT_USER_WORDLIST,
+                )
+                if args.oscp:
+                    # Drop tools restricted on the OSCP exam (record what we omitted).
+                    kept = []
+                    for s in host_suggestions:
+                        if s["tool"] in OSCP_PROHIBITED_TOOLS:
+                            oscp_omitted.add(s["tool"])
+                        else:
+                            kept.append(s)
+                    host_suggestions = kept
+                if args.suggest:
+                    # Use the same pinned host the loot paths are keyed on.
+                    print_suggestions(loot_host, host_suggestions)
+                all_suggestions.extend(host_suggestions)
 
         if args.save and host_dir:
             write_host_report(host_dir, ip_addr, hostname, extra, tcp_services, udp_services)
@@ -2922,26 +3492,36 @@ def main() -> None:
         else:
             info("OSCP profile active: no restricted tools were applicable to these hosts.")
 
-    if args.suggest and all_suggestions:
-        script_dir = base_outdir if (args.save and base_outdir) else Path(".")
-        try:
-            written = write_recon_scripts(script_dir, all_suggestions, LOOT_DIR)
-            for path in written:
-                good(f"Recon script written: {path}")
-            good(f"Next: run the script, then `{PATHFINDER_SCAN_CMD} {LOOT_DIR}/`")
-        except OSError as exc:
-            err(f"Could not write recon script: {exc}")
+    if args.suggest:
+        if args.ai_only:
+            good(f"AI-only mode: AI surfaces written under {LOOT_DIR}/. "
+                 f"Next: `{PATHFINDER_SCAN_CMD} {LOOT_DIR}/`")
+        elif all_suggestions:
+            script_dir = base_outdir if (args.save and base_outdir) else Path(".")
+            try:
+                written = write_recon_scripts(script_dir, all_suggestions, LOOT_DIR)
+                for path in written:
+                    good(f"Recon script written: {path}")
+                good(f"Next: run the script, then `{PATHFINDER_SCAN_CMD} {LOOT_DIR}/`")
+            except OSError as exc:
+                err(f"Could not write recon script: {exc}")
 
     if args.run:
-        if not all_suggestions:
-            warn("--run: no suggestions generated from discovered services; nothing to run.")
-        else:
-            run_suggestions(
+        run_result = None
+        if all_suggestions:
+            run_result = run_suggestions(
                 all_suggestions, LOOT_DIR, DEFAULT_WEB_WORDLIST, DEFAULT_USER_WORDLIST,
                 idle_timeout=args.run_timeout,
             )
-            pathfinder_path = str(Path(__file__).resolve().parent.parent / "PathFinder")
-            run_pathfinder(pathfinder_path, LOOT_DIR, oscp=args.oscp)
+        elif not args.ai_only:
+            warn("--run: no suggestions generated from discovered services; nothing to run.")
+        if run_result and run_result.get("interrupted"):
+            warn("--run interrupted: skipping PathFinder analysis of partial recon loot.")
+            return
+        # Always analyse with PathFinder (in --ai-only there are no tool commands,
+        # but the AI surfaces were handed off for analysis).
+        pathfinder_path = str(Path(__file__).resolve().parent.parent / "PathFinder")
+        run_pathfinder(pathfinder_path, LOOT_DIR, oscp=args.oscp)
 
 
 if __name__ == "__main__":

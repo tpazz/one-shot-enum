@@ -22,7 +22,7 @@ python one-shot-enum.py 10.10.10.5
 python one-shot-enum.py 10.10.10.0/24 --threads 20
 python one-shot-enum.py 10.10.10.10-20 --ports 22,80,443,8000-8010
 python one-shot-enum.py localhost --llm-endpoint
-python one-shot-enum.py 10.10.10.5 --llm-full --hello --save
+python one-shot-enum.py 10.10.10.5 --llm-endpoint --save
 python one-shot-enum.py 10.10.10.5 --ai-paths
 ```
 
@@ -53,6 +53,18 @@ Two modes, quick vs rich:
 
 - `--llm-endpoint` — a **quick, read-only peek**: detect LLM/API-like HTTP services and list their discovered OpenAPI endpoints. No path probing, no PathFinder handoff.
 - `--ai-paths` — the **rich** mode: probe *all* HTTP-like services, fingerprint common AI/ML/RAG components (OpenAI-compatible APIs, Ollama, vLLM, TGI, LangServe, Gradio, agent/MCP, vector stores, MLflow, model servers, Jupyter, workflow builders, image-gen), and print prioritized attack-path next steps. `--ai-paths` is a strict superset of `--llm-endpoint`. With `--suggest`/`--run` it also hands the detected surfaces to PathFinder (see below).
+- `--ai-only` — with `--suggest`/`--run`, focus on AI surfaces **only**: hand the AI enumeration to PathFinder and skip every other recon tool. Implies `--ai-paths`. Use it for a fast, targeted AI-target pass without gobuster/nikto/SMB/etc. noise (`one-shot-enum <target> --ai-only --run`).
+- `--ai-active` — **active (still read-only) confirmation** on top of `--ai-paths`: for MCP/A2A surfaces it fetches agent-discovery documents (`/.well-known/agent.json`, `/agents`) and sends the standard MCP JSON-RPC `initialize` + `tools/list` handshake to turn *inferred* capabilities into a *confirmed* tool inventory (each tool categorised as filesystem / code-execution / network-egress / database / secrets / source-control). It never invokes a tool. Implies `--ai-paths`.
+
+When a surface looks like a **vector store** (Qdrant / Chroma / Weaviate / OpenSearch), `--ai-paths` also does a read-only "plaintext first" check: it lists the collections/classes/indices and flags the store if it answers **unauthenticated** — usually the highest-value RAG win, since the source chunks are readable without any embedding inversion.
+
+Beyond the framework fingerprint, `--ai-paths` also profiles the **agent itself** from its endpoint names — its role, its architecture (topology), and, where a path fingerprint gives it away, its orchestration framework:
+
+- **Role** — the most security-relevant capability, e.g. *Code / Execution agent*, *A2A / multi-agent system*, *MCP / tool server*, *Embedding / vector store*, *Knowledge Base / RAG agent*, *Database / NL-to-SQL agent*, *Tool-using single agent*, *Conversational agent / chatbot*.
+- **Architecture** — the KB/RAG-vs-Single-vs-Multi bucket from the AI-red-team playbook: `multi-agent` (A2A / orchestrator), `tool-server` (MCP), `vector-store` (embedding DB), `rag`, or `single-agent`.
+- **Framework** — Google A2A, Model Context Protocol, LangGraph, CrewAI, or OpenAI Swarm when their route fingerprints (`/.well-known/agent.json`, `/mcp`, `/threads`+`/runs`+`/assistants`, `/kickoff`, `/swarm`, …) are present.
+
+For example, a service exposing `/kb/*`, `/browse`, `/upload`, and `/chat` is flagged as a **Knowledge Base / RAG agent** (`rag`) with `web-browsing`, `file-processing`, `tool-calling`, and `database` capabilities; one exposing `/.well-known/agent.json` and `/agents/register` is an **A2A / multi-agent system**. The security-relevant capabilities (code-execution, tool-calling, mcp-tooling, orchestration, agent-discovery) are highlighted. This profile is shown inline and handed to PathFinder even when the service matches no known framework (custom FastAPI agents, etc.), where it drives archetype-specific attack paths.
 
 Enumeration is read-only — it fingerprints and lists; it never sends prompts to a model. Prompt injection / jailbreak testing is left to you (PathFinder's AI rules point you at it).
 
@@ -61,6 +73,7 @@ Current fingerprints include:
 - OpenAI-compatible APIs, vLLM, TGI, Ollama, LangServe, and Gradio
 - MCP and agent discovery surfaces
 - RAG/vector stores such as Qdrant, Chroma, Weaviate, OpenSearch, and Elasticsearch
+- MinIO / S3-compatible object stores that commonly back MLflow and model-artifact pipelines
 - MLflow, TorchServe, Triton, BentoML, TensorFlow Serving, and generic model-serving APIs
 - Jupyter, Flowise, Dify, AnythingLLM, Stable Diffusion WebUI, and ComfyUI
 
@@ -109,7 +122,7 @@ services into the right follow-up commands for it, in two modes — pick one.
 
 Prints the next-step enumeration commands for each discovered service (gobuster,
 ffuf, nikto, whatweb, nuclei, wpscan, enum4linux-ng, smbmap, netexec,
-snmp-check, kerbrute, GetNPUsers, and more), with output flags that PathFinder's
+snmp-check, showmount/NFS, kerbrute, GetNPUsers, and more), with output flags that PathFinder's
 `scan` auto-detector understands, and writes a runnable `pathfinder_recon.sh`
 (plus `pathfinder_recon.ps1` for Windows post-foothold steps).
 
@@ -162,7 +175,15 @@ post-foothold commands are never executed. Intended for the Kali/attack host
 python one-shot-enum.py 10.10.10.10 --run
 python one-shot-enum.py 10.10.10.0/24 --run           # concurrency auto-scales to hosts
 python one-shot-enum.py 10.10.10.10 --run --run-timeout 300
+python one-shot-enum.py 10.10.10.10 --run --scan-timeout 900
+python one-shot-enum.py 10.10.10.10 --run --loot-dir loot-clientA   # isolate this engagement
 ```
+
+Loot goes to `loot/` by default; `--loot-dir <dir>` chooses another. Because
+PathFinder analyses the **whole** loot tree, `--suggest`/`--run` warn if the loot
+dir already contains host directories that aren't in the current target set (stale
+data from a previous engagement) — use a fresh `--loot-dir` per engagement to keep
+runs from mixing.
 
 **Concurrency is one lane per host** — each host runs up to two tools at once and
 the lanes run in parallel, so a multi-host sweep goes fast while no single target
@@ -185,7 +206,10 @@ Recon [2 host lane(s), 2/host]: 3 running, 2 done, 1 skipped, 0 other
 A tool that produces **no output for `--run-timeout` seconds (default 180)** is
 treated as hung and killed — so one stuck scanner never stalls the pipeline; it's
 marked `timed out` and the other lanes carry on. Set `--run-timeout 0` to
-disable. Each tool's full output is captured to `loot/_logs/<tool>_<host>.log` so
+disable. `--scan-timeout` sets the wall-clock ceiling for each Nmap invocation
+(default 1800 seconds; `0` disables), which keeps slow filtered hosts from pinning
+the initial discovery/service-scan stage. Each tool's full output is captured to
+`loot/_logs/<tool>_<host>_<idx>.log` so
 nothing is lost and failures stay diagnosable.
 
 ### OSCP profile
