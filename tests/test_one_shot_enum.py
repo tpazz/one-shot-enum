@@ -143,6 +143,7 @@ class GeneratedCommandTests(unittest.TestCase):
         self.assertNotIn("wpscan", cmds)
         self.assertNotIn("nuclei", cmds)
         self.assertNotIn("sqlmap", cmds)
+        self.assertIn(f"-maxtime {ose.DEFAULT_FFUF_MAXTIME}", cmds["ffuf"])
 
     def test_wordpress_detection_adds_wpscan(self):
         wp = make_service(port=80, service="http", scripts="http-wordpress-users wp-content")
@@ -217,6 +218,19 @@ class GeneratedCommandTests(unittest.TestCase):
         )
         self.assertEqual(wrapped, command)
         self.assertIsNone(executable)
+
+    def test_status_row_truncates_long_tool_and_progress(self):
+        row = ose._format_job_row({
+            "tool": "impacket-GetNPUsers",
+            "host": "192.168.102.13",
+            "state": "interrupted",
+            "last": ":: Progress: [2440/29999] :: Job [1/1] :: 2 req/sec :: Duration: [really long]",
+            "start": 90.0,
+            "end": None,
+        }, now=100.0, width=72)
+        self.assertLessEqual(len(row), 72)
+        self.assertIn("impacket-GetNPUse~", row)
+        self.assertIn("192.168.102.13", row)
 
 
 class LootPathTests(unittest.TestCase):

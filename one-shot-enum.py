@@ -2340,6 +2340,7 @@ LOOT_DIR = "loot"
 DEFAULT_WEB_WORDLIST = "/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt"
 DEFAULT_USER_WORDLIST = "/usr/share/seclists/Usernames/top-usernames-shortlist.txt"
 PATHFINDER_SCAN_CMD = "python3 -m main.pathfinder scan"
+DEFAULT_FFUF_MAXTIME = 180
 
 # --run concurrency: one lane per host, this many tools at once within a lane.
 # Concurrency auto-scales with the number of hosts (lanes run in parallel), so a
@@ -2521,7 +2522,8 @@ def _web_suggestions(host: str, service: Service, loot: str, wordlist: str,
         _suggestion(host, group, "whatweb",
                     f"whatweb -a3 {base} --log-json={_lootpath(loot, f'whatweb_{port}.json')}", "whatweb_json"),
         _suggestion(host, group, "ffuf",
-                    f"ffuf -u {base}/FUZZ -w {wl}{k} -of json -o {_lootpath(loot, f'ffuf_{port}.json')}",
+                    f"ffuf -u {base}/FUZZ -w {wl}{k} -maxtime {DEFAULT_FFUF_MAXTIME} "
+                    f"-of json -o {_lootpath(loot, f'ffuf_{port}.json')}",
                     "ffuf_json"),
         _suggestion(host, group, "nikto",
                     f"nikto -h {base} -Format json -o {_lootpath(loot, f'nikto_{port}.json')}", "nikto_json"),
@@ -2842,6 +2844,40 @@ def _fmt_elapsed(seconds: float) -> str:
     return f"{total // 60:02d}:{total % 60:02d}"
 
 
+TOOL_COL_WIDTH = 18
+HOST_COL_WIDTH = 15
+STATE_COL_WIDTH = 14
+DEFAULT_STATUS_WIDTH = 120
+
+
+def _fit_cell(value: Any, width: int) -> str:
+    text = str(value or "")
+    if len(text) > width:
+        return text[:max(0, width - 1)] + "~"
+    return text.ljust(width)
+
+
+def _clean_status_line(value: str) -> str:
+    return " ".join(str(value or "").replace("\r", " ").split())
+
+
+def _format_job_row(job: Dict[str, Any], now: float, width: int = DEFAULT_STATUS_WIDTH) -> str:
+    state = job["state"]
+    disp = {"skip:no-tool": "skip (no tool)", "skip:no-wordlist": "skip (no wl)"}.get(state, state)
+    elapsed = _fmt_elapsed((job["end"] or now) - job["start"]) if job["start"] else "--:--"
+    row = (
+        f"  {_fit_cell(job['tool'], TOOL_COL_WIDTH)}"
+        f"  {_fit_cell(job['host'], HOST_COL_WIDTH)}"
+        f"  {_fit_cell(disp, STATE_COL_WIDTH)}"
+        f"  {elapsed}"
+    )
+    if state == "running" and job["last"]:
+        suffix = "  | "
+        remaining = max(0, width - len(row) - len(suffix))
+        row += suffix + _fit_cell(_clean_status_line(job["last"]), remaining).rstrip()
+    return row[:width]
+
+
 class _LiveTable:
     """Minimal in-place multi-line renderer for a refreshing status table (TTY only)."""
 
@@ -2936,7 +2972,7 @@ def _run_worker(job: Dict[str, Any], lock: threading.Lock, tty: bool) -> None:
                 with lock:
                     job["last_output"] = time.time()
                     if stripped:
-                        job["last"] = stripped[:70]
+                        job["last"] = _clean_status_line(stripped)
             proc.wait()
             job["rc"] = proc.returncode
     except Exception as exc:
@@ -3025,6 +3061,7 @@ def run_suggestions(all_suggestions: List[Dict[str, Any]],
 
     def build_lines() -> List[str]:
         now = time.time()
+        width = max(80, shutil.get_terminal_size((DEFAULT_STATUS_WIDTH, 20)).columns)
         running = sum(1 for j in jobs if j["state"] == "running")
         done = sum(1 for j in jobs if j["state"] == "done")
         skipped = sum(1 for j in jobs if j["state"].startswith("skip"))
@@ -3033,13 +3070,7 @@ def run_suggestions(all_suggestions: List[Dict[str, Any]],
                   f"{running} running, {done} done, {skipped} skipped, {other} other")
         lines = [color(header, C.BOLD)]
         for j in jobs:
-            state = j["state"]
-            disp = {"skip:no-tool": "skip (no tool)", "skip:no-wordlist": "skip (no wl)"}.get(state, state)
-            elapsed = _fmt_elapsed((j["end"] or now) - j["start"]) if j["start"] else "--:--"
-            row = f"  {j['tool']:<16}{j['host']:<16}{disp:<16}{elapsed}"
-            if state == "running" and j["last"]:
-                row += f"  | {j['last']}"
-            lines.append(row)
+            lines.append(_format_job_row(j, now, width))
         return lines
 
     def enforce_idle_timeout():

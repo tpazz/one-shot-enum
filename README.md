@@ -217,8 +217,10 @@ Recon [2 host lane(s), 2/host]: 3 running, 2 done, 1 skipped, 0 other
 A tool that produces **no output for `--run-timeout` seconds (default 180)** is
 treated as hung and killed — so one stuck scanner never stalls the pipeline; it's
 marked `timed out` and the other lanes carry on. Set `--run-timeout 0` to
-disable. `--scan-timeout` sets the wall-clock ceiling for each Nmap invocation
-(default 1800 seconds; `0` disables), which keeps slow filtered hosts from pinning
+disable. ffuf also gets `-maxtime 180` by default, because it can keep printing
+slow progress forever and therefore never trip an idle-output timeout.
+`--scan-timeout` sets the wall-clock ceiling for each Nmap invocation (default
+1800 seconds; `0` disables), which keeps slow filtered hosts from pinning
 the initial discovery/service-scan stage. Each tool's full output is captured to
 `loot/_logs/<tool>_<host>_<idx>.log` so
 nothing is lost and failures stay diagnosable.
