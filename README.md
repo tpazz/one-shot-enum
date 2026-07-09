@@ -122,7 +122,8 @@ services into the right follow-up commands for it, in two modes — pick one.
 
 Prints the next-step enumeration commands for each discovered service (gobuster,
 ffuf, nikto, whatweb, nuclei, wpscan, enum4linux-ng, smbmap, netexec,
-snmp-check, showmount/NFS, kerbrute, GetNPUsers, and more), with output flags that PathFinder's
+snmp-check, showmount/NFS, redis-cli, rsync, smtp-user-enum, kerbrute,
+GetNPUsers, and more), with output flags that PathFinder's
 `scan` auto-detector understands, and writes a runnable `pathfinder_recon.sh`
 (plus `pathfinder_recon.ps1` for Windows post-foothold steps).
 

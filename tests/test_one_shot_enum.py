@@ -136,8 +136,11 @@ class GeneratedCommandTests(unittest.TestCase):
         web = make_service(port=80, service="http")
         smb = make_service(port=445, service="microsoft-ds")
         nfs = make_service(port=2049, service="nfs")
+        redis = make_service(port=6379, service="redis")
+        rsync = make_service(port=873, service="rsync")
+        smtp = make_service(port=25, service="smtp")
         snmp = make_service(port=161, service="snmp", protocol="udp")
-        sugg = ose.suggest_for_host("10.0.0.5", [web, smb, nfs], [snmp], loot, wordlist, "/users.txt")
+        sugg = ose.suggest_for_host("10.0.0.5", [web, smb, nfs, redis, rsync, smtp], [snmp], loot, wordlist, "/users.txt")
         return {s["tool"]: s["command"] for s in sugg}
 
     def test_smbmap_and_snmpcheck_use_tee_not_redirect(self):
@@ -148,11 +151,23 @@ class GeneratedCommandTests(unittest.TestCase):
         self.assertNotIn(" > ", cmds["snmp-check"])
         self.assertIn("| tee ", cmds["showmount"])
         self.assertNotIn(" > ", cmds["showmount"])
+        self.assertIn("| tee ", cmds["redis-cli"])
+        self.assertIn("| tee ", cmds["rsync"])
+        self.assertIn("| tee ", cmds["smtp-user-enum"])
 
     def test_nfs_suggestion_feeds_pathfinder_parser(self):
         cmds = self._commands()
         self.assertIn("showmount -e 10.0.0.5", cmds["showmount"])
         self.assertIn("loot/10.0.0.5/nfs_10.0.0.5.txt", cmds["showmount"])
+
+    def test_redis_rsync_smtp_suggestions_feed_pathfinder_parsers(self):
+        cmds = self._commands()
+        self.assertIn("redis-cli -h 10.0.0.5 -p 6379 INFO", cmds["redis-cli"])
+        self.assertIn("loot/10.0.0.5/redis_6379.txt", cmds["redis-cli"])
+        self.assertIn("rsync --list-only rsync://10.0.0.5/", cmds["rsync"])
+        self.assertIn("loot/10.0.0.5/rsync_10.0.0.5.txt", cmds["rsync"])
+        self.assertIn("smtp-user-enum -M VRFY -U /users.txt -t 10.0.0.5 -p 25", cmds["smtp-user-enum"])
+        self.assertIn("loot/10.0.0.5/smtp_user_enum_25.txt", cmds["smtp-user-enum"])
 
     def test_loot_dir_with_spaces_is_quoted(self):
         cmds = self._commands(loot="my loot")
@@ -169,6 +184,25 @@ class GeneratedCommandTests(unittest.TestCase):
         cmds = self._commands()
         self.assertIn("loot/10.0.0.5/gobuster_80.txt", cmds["gobuster"])
         self.assertNotIn("'loot", cmds["gobuster"])
+
+    def test_run_worker_preserves_piped_command_exit_status_on_posix(self):
+        command, executable = ose._command_with_pipefail(
+            "showmount -e 10.0.0.5 | tee loot/10.0.0.5/nfs.txt",
+            os_name="posix",
+            bash_path="/bin/bash",
+        )
+        self.assertEqual(executable, "/bin/bash")
+        self.assertTrue(command.startswith("set -o pipefail\n"))
+
+    def test_run_worker_leaves_unpiped_commands_unchanged(self):
+        command = "nxc smb 10.0.0.5 --shares --log loot/10.0.0.5/nxc.log"
+        wrapped, executable = ose._command_with_pipefail(
+            command,
+            os_name="posix",
+            bash_path="/bin/bash",
+        )
+        self.assertEqual(wrapped, command)
+        self.assertIsNone(executable)
 
 
 class LootPathTests(unittest.TestCase):

@@ -2366,6 +2366,9 @@ LDAP_PORTS = {389, 636, 3268, 3269}
 KERBEROS_PORTS = {88}
 SNMP_PORTS = {161}
 NFS_PORTS = {111, 2049}
+REDIS_PORTS = {6379}
+RSYNC_PORTS = {873}
+SMTP_PORTS = {25, 465, 587}
 
 DOMAIN_PLACEHOLDER = "<domain>"
 USER_PLACEHOLDER = "<user>"
@@ -2569,6 +2572,35 @@ def _nfs_suggestions(host: str, loot: str) -> List[Dict[str, Any]]:
     ]
 
 
+def _redis_suggestions(host: str, service: Service, loot: str) -> List[Dict[str, Any]]:
+    port = _svc_port(service) or 6379
+    return [
+        _suggestion(host, f"redis:{port}", "redis-cli",
+                    f"redis-cli -h {host} -p {port} INFO | tee {_lootpath(loot, f'redis_{port}.txt')}",
+                    "redis_txt"),
+    ]
+
+
+def _rsync_suggestions(host: str, loot: str) -> List[Dict[str, Any]]:
+    tag = safe_name(host)
+    return [
+        _suggestion(host, "rsync", "rsync",
+                    f"rsync --list-only rsync://{host}/ | tee {_lootpath(loot, f'rsync_{tag}.txt')}",
+                    "rsync_txt"),
+    ]
+
+
+def _smtp_suggestions(host: str, service: Service, loot: str, userlist: str) -> List[Dict[str, Any]]:
+    port = _svc_port(service) or 25
+    ul = shlex.quote(userlist)
+    return [
+        _suggestion(host, f"smtp:{port}", "smtp-user-enum",
+                    f"smtp-user-enum -M VRFY -U {ul} -t {host} -p {port} | tee "
+                    f"{_lootpath(loot, f'smtp_user_enum_{port}.txt')}",
+                    "smtp_user_enum_txt"),
+    ]
+
+
 def _ad_suggestions(host: str, loot: str, userlist: str) -> List[Dict[str, Any]]:
     dom, user, pw = DOMAIN_PLACEHOLDER, USER_PLACEHOLDER, PASS_PLACEHOLDER
     ul = shlex.quote(userlist)
@@ -2620,6 +2652,7 @@ def suggest_for_host(host: str,
     has_ad = False
     has_snmp = False
     has_nfs = False
+    has_rsync = False
 
     # Per-host loot subdirectory so PathFinder attributes every file to this host
     # and files from different hosts never collide.
@@ -2637,6 +2670,12 @@ def suggest_for_host(host: str,
         if "nfs" in _svc_name(service) or "mountd" in _svc_name(service) or "rpcbind" in _svc_name(service) \
                 or port in NFS_PORTS:
             has_nfs = True
+        if "redis" in _svc_name(service) or port in REDIS_PORTS:
+            suggestions.extend(_redis_suggestions(host, service, host_loot))
+        if "rsync" in _svc_name(service) or port in RSYNC_PORTS:
+            has_rsync = True
+        if "smtp" in _svc_name(service) or port in SMTP_PORTS:
+            suggestions.extend(_smtp_suggestions(host, service, host_loot, userlist))
 
     for service in list(udp_services) + list(tcp_services):
         if "snmp" in _svc_name(service) or _svc_port(service) in SNMP_PORTS:
@@ -2644,6 +2683,8 @@ def suggest_for_host(host: str,
         if "nfs" in _svc_name(service) or "mountd" in _svc_name(service) or "rpcbind" in _svc_name(service) \
                 or _svc_port(service) in NFS_PORTS:
             has_nfs = True
+        if "rsync" in _svc_name(service) or _svc_port(service) in RSYNC_PORTS:
+            has_rsync = True
 
     if has_smb:
         suggestions.extend(_smb_suggestions(host, host_loot))
@@ -2651,6 +2692,8 @@ def suggest_for_host(host: str,
         suggestions.extend(_snmp_suggestions(host, host_loot))
     if has_nfs:
         suggestions.extend(_nfs_suggestions(host, host_loot))
+    if has_rsync:
+        suggestions.extend(_rsync_suggestions(host, host_loot))
     if has_ad:
         suggestions.extend(_ad_suggestions(host, host_loot, userlist))
     suggestions.extend(_post_foothold_suggestions(host, host_loot))
@@ -2845,6 +2888,19 @@ def _terminate_process(proc) -> None:
         pass
 
 
+def _command_with_pipefail(command: str,
+                           os_name: Optional[str] = None,
+                           bash_path: Optional[str] = None) -> Tuple[str, Optional[str]]:
+    """Run piped POSIX commands under bash pipefail so tee does not hide failures."""
+    current_os = os_name or os.name
+    if current_os != "posix" or "|" not in command:
+        return command, None
+    bash = bash_path if bash_path is not None else shutil.which("bash")
+    if not bash:
+        return command, None
+    return f"set -o pipefail\n{command}", bash
+
+
 def _run_worker(job: Dict[str, Any], lock: threading.Lock, tty: bool) -> None:
     with lock:
         if job.get("interrupted") or job.get("state") == "interrupted":
@@ -2856,7 +2912,9 @@ def _run_worker(job: Dict[str, Any], lock: threading.Lock, tty: bool) -> None:
         job["last_output"] = job["start"]
     try:
         with open(job["logpath"], "w", encoding="utf-8", errors="replace") as logf:
-            # shell=True so redirections (snmp-check > file) and quoting work.
+            command, shell_executable = _command_with_pipefail(job["command"])
+            # shell=True so redirections, pipes, and quoting work. On POSIX,
+            # piped commands use bash pipefail so tee does not mask tool failures.
             # stdin=DEVNULL so a tool that prompts for input gets EOF instead of
             # blocking forever. On POSIX start_new_session gives the tool its own
             # process group so the idle-timeout can kill it (not just the shell).
@@ -2864,9 +2922,11 @@ def _run_worker(job: Dict[str, Any], lock: threading.Lock, tty: bool) -> None:
                 shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL, text=True, bufsize=1, errors="replace",
             )
+            if shell_executable:
+                popen_kwargs["executable"] = shell_executable
             if os.name == "posix":
                 popen_kwargs["start_new_session"] = True
-            proc = subprocess.Popen(job["command"], **popen_kwargs)
+            proc = subprocess.Popen(command, **popen_kwargs)
             with lock:
                 job["proc"] = proc
             # text mode uses universal newlines, so carriage-return progress lines
