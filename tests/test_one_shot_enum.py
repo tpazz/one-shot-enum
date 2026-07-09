@@ -134,6 +134,9 @@ class GeneratedCommandTests(unittest.TestCase):
                                     loot, wordlist, "/users.txt", power=power)
         return {s["tool"]: s["command"] for s in sugg}
 
+    def _suggestions(self, services):
+        return ose.suggest_for_host("10.0.0.5", services, [], "loot", "/wl.txt", "/users.txt")
+
     def test_default_web_commands_are_lean(self):
         cmds = self._commands()
         self.assertIn("ffuf", cmds)
@@ -200,6 +203,75 @@ class GeneratedCommandTests(unittest.TestCase):
         self.assertIn("loot/10.0.0.5/ffuf_80.json", cmds["ffuf"])
         self.assertNotIn("'loot", cmds["ffuf"])
 
+    def test_ad_placeholder_commands_are_not_runnable(self):
+        suggestions = self._suggestions([make_service(port=88, service="kerberos-sec")])
+        cmds = {s["tool"]: s["command"] for s in suggestions}
+
+        self.assertIn("kerbrute", cmds)
+        self.assertIn("impacket-GetNPUsers", cmds)
+        self.assertIn("<domain>", cmds["kerbrute"])
+        self.assertIn("<domain>", cmds["impacket-GetNPUsers"])
+
+        runnable_tools = {s["tool"] for s in ose.runnable_suggestions(suggestions)}
+        self.assertNotIn("kerbrute", runnable_tools)
+        self.assertNotIn("impacket-GetNPUsers", runnable_tools)
+
+    def test_ad_domain_from_ldap_makes_userenum_runnable(self):
+        ldap = make_service(
+            port=389,
+            service="ldap",
+            product="Microsoft Windows Active Directory LDAP",
+            extrainfo="Domain: researchmco.ai, Site: Default-First-Site-Name",
+        )
+        suggestions = self._suggestions([ldap])
+        cmds = {s["tool"]: s["command"] for s in suggestions}
+
+        self.assertIn("kerbrute userenum -d researchmco.ai", cmds["kerbrute"])
+        self.assertIn("impacket-GetNPUsers researchmco.ai/", cmds["impacket-GetNPUsers"])
+
+        runnable_tools = {s["tool"] for s in ose.runnable_suggestions(suggestions)}
+        self.assertIn("kerbrute", runnable_tools)
+        self.assertIn("impacket-GetNPUsers", runnable_tools)
+
+    def test_ad_domain_from_rdp_ntlm_info_is_used(self):
+        rdp = make_service(
+            port=3389,
+            service="ms-wbt-server",
+            scripts="rdp-ntlm-info: DNS_Domain_Name: researchmco.ai\nDNS_Computer_Name: DC01.researchmco.ai",
+        )
+        kerberos = make_service(port=88, service="kerberos-sec")
+        suggestions = self._suggestions([kerberos, rdp])
+        cmds = {s["tool"]: s["command"] for s in suggestions}
+
+        self.assertIn("kerbrute userenum -d researchmco.ai", cmds["kerbrute"])
+        self.assertIn("impacket-GetNPUsers researchmco.ai/", cmds["impacket-GetNPUsers"])
+
+    def test_generated_script_comments_placeholder_commands(self):
+        suggestions = self._suggestions([make_service(port=88, service="kerberos-sec")])
+        with tempfile.TemporaryDirectory() as d:
+            paths = ose.write_recon_scripts(Path(d), suggestions, "loot")
+            bash = next(p for p in paths if p.name == "pathfinder_recon.sh").read_text(encoding="utf-8")
+
+        self.assertIn("# kerbrute userenum -d <domain>", bash)
+        self.assertIn("# impacket-GetNPUsers <domain>/", bash)
+        self.assertIn("edit placeholders", bash)
+
+    def test_generated_script_leaves_inferred_domain_userenum_live(self):
+        ldap = make_service(port=389, service="ldap", extrainfo="Domain: researchmco.ai, Site: Default-First-Site-Name")
+        suggestions = self._suggestions([ldap])
+        with tempfile.TemporaryDirectory() as d:
+            paths = ose.write_recon_scripts(Path(d), suggestions, "loot")
+            bash = next(p for p in paths if p.name == "pathfinder_recon.sh").read_text(encoding="utf-8")
+
+        self.assertIn("kerbrute userenum -d researchmco.ai", bash)
+        self.assertIn("impacket-GetNPUsers researchmco.ai/", bash)
+        self.assertNotIn("# kerbrute userenum -d researchmco.ai", bash)
+        self.assertNotIn("# impacket-GetNPUsers researchmco.ai/", bash)
+
+    def test_ad_domain_inference_falls_back_to_cert_common_name(self):
+        rdp = make_service(port=3389, service="ms-wbt-server", scripts="ssl-cert: Subject: commonName=DC01.researchmco.ai")
+        self.assertEqual(ose.infer_ad_domain([rdp]), "researchmco.ai")
+
     def test_run_worker_preserves_piped_command_exit_status_on_posix(self):
         command, executable = ose._command_with_pipefail(
             "showmount -e 10.0.0.5 | tee loot/10.0.0.5/nfs.txt",
@@ -229,7 +301,7 @@ class GeneratedCommandTests(unittest.TestCase):
             "end": None,
         }, now=100.0, width=72)
         self.assertLessEqual(len(row), 72)
-        self.assertIn("impacket-GetNPUse~", row)
+        self.assertIn("impacket-GetNPUsers", row)
         self.assertIn("192.168.102.13", row)
 
 

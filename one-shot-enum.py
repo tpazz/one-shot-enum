@@ -2370,6 +2370,64 @@ SMTP_PORTS = {25, 465, 587}
 DOMAIN_PLACEHOLDER = "<domain>"
 USER_PLACEHOLDER = "<user>"
 PASS_PLACEHOLDER = "<pass>"
+PLACEHOLDERS = (DOMAIN_PLACEHOLDER, USER_PLACEHOLDER, PASS_PLACEHOLDER)
+DNS_DOMAIN_RE = re.compile(r"(?i)\b(?:DNS_Domain_Name|Domain):\s*([a-z0-9][a-z0-9.-]*\.[a-z]{2,})\b")
+CERT_CN_RE = re.compile(r"(?i)\bcommonName=([a-z0-9_-]+\.[a-z0-9][a-z0-9.-]*\.[a-z]{2,})\b")
+
+
+def _has_placeholder(value: str) -> bool:
+    return any(token in value for token in PLACEHOLDERS)
+
+
+def _suggestion_has_placeholder(s: Dict[str, Any]) -> bool:
+    return _has_placeholder(str(s.get("command", "")))
+
+
+def _clean_dns_domain(candidate: str) -> str:
+    domain = candidate.strip().strip(".,;:)").lower()
+    if len(domain) > 253 or "." not in domain:
+        return ""
+    labels = domain.split(".")
+    if len(labels) < 2:
+        return ""
+    for label in labels:
+        if not label or len(label) > 63:
+            return ""
+        if label.startswith("-") or label.endswith("-"):
+            return ""
+        if not re.fullmatch(r"[a-z0-9-]+", label):
+            return ""
+    return domain
+
+
+def _domain_from_fqdn(fqdn: str) -> str:
+    clean = _clean_dns_domain(fqdn)
+    if not clean:
+        return ""
+    labels = clean.split(".")
+    if len(labels) >= 3:
+        return ".".join(labels[1:])
+    return clean
+
+
+def infer_ad_domain(tcp_services: List[Service]) -> str:
+    """Infer an AD DNS domain from Nmap LDAP/RDP script and service metadata."""
+    fallback = ""
+    for service in tcp_services:
+        blob = "\n".join([
+            str(service.get("scripts", "")),
+            str(service.get("extrainfo", "")),
+            str(service.get("product", "")),
+        ])
+        for match in DNS_DOMAIN_RE.finditer(blob):
+            domain = _clean_dns_domain(match.group(1))
+            if domain:
+                return domain
+        if not fallback:
+            cn_match = CERT_CN_RE.search(blob)
+            if cn_match:
+                fallback = _domain_from_fqdn(cn_match.group(1))
+    return fallback
 
 
 def host_loot_dir(loot: str, host: str) -> str:
@@ -2601,16 +2659,19 @@ def _smtp_suggestions(host: str, service: Service, loot: str, userlist: str) -> 
     ]
 
 
-def _ad_suggestions(host: str, loot: str, userlist: str) -> List[Dict[str, Any]]:
-    dom, user, pw = DOMAIN_PLACEHOLDER, USER_PLACEHOLDER, PASS_PLACEHOLDER
+def _ad_suggestions(host: str, loot: str, userlist: str, domain: str = "") -> List[Dict[str, Any]]:
+    dom = domain or DOMAIN_PLACEHOLDER
+    user, pw = USER_PLACEHOLDER, PASS_PLACEHOLDER
+    domain_note = f"domain inferred from nmap: {domain}" if domain else ""
     ul = shlex.quote(userlist)
     return [
         _suggestion(host, "ad kerberos", "kerbrute",
                     f"kerbrute userenum -d {dom} --dc {host} {ul} -o {_lootpath(loot, 'kerbrute.txt')}",
-                    "kerbrute_txt"),
+                    "kerbrute_txt", note=domain_note),
         _suggestion(host, "ad kerberos", "impacket-GetNPUsers",
                     f"impacket-GetNPUsers {dom}/ -dc-ip {host} -usersfile {ul} "
-                    f"-format hashcat -outputfile {_lootpath(loot, 'getnpusers.txt')}", "getnpusers_hashes"),
+                    f"-format hashcat -outputfile {_lootpath(loot, 'getnpusers.txt')}", "getnpusers_hashes",
+                    note=domain_note),
         _suggestion(host, "ad (needs creds)", "ldapdomaindump",
                     f"ldapdomaindump -u '{dom}\\{user}' -p '{pw}' {host} -o {_lootpath(loot, 'ldap/')}",
                     "ldapdomaindump_dir", gated=True),
@@ -2696,7 +2757,7 @@ def suggest_for_host(host: str,
     if has_rsync:
         suggestions.extend(_rsync_suggestions(host, host_loot))
     if has_ad:
-        suggestions.extend(_ad_suggestions(host, host_loot, userlist))
+        suggestions.extend(_ad_suggestions(host, host_loot, userlist, infer_ad_domain(tcp_services)))
     suggestions.extend(_post_foothold_suggestions(host, host_loot))
 
     seen: Set[Tuple[str, str, str]] = set()
@@ -2732,6 +2793,8 @@ def print_suggestions(host: str, suggestions: List[Dict[str, Any]]) -> None:
                 tags.append("parser pending")
             if s["gated"]:
                 tags.append("needs creds/foothold")
+            if _suggestion_has_placeholder(s):
+                tags.append("edit placeholders")
             tag_text = color("  [" + ", ".join(tags) + "]", C.GREY) if tags else ""
             print(f"    {s['command']}{tag_text}")
             meta = f"-> {s['parser']}"
@@ -2747,12 +2810,14 @@ def _script_line(s: Dict[str, Any]) -> str:
         notes.append("parser pending")
     if s["gated"]:
         notes.append("needs creds/foothold")
+    if _suggestion_has_placeholder(s):
+        notes.append("edit placeholders")
     if s["note"]:
         notes.append(s["note"])
     line = f"{s['command']}   # {'; '.join(notes)}"
-    # Gated commands (need creds or a foothold) are emitted commented-out so the
-    # script never runs anything unattended that depends on placeholders.
-    return f"# {line}" if s["gated"] else line
+    # Gated commands and unresolved placeholders are emitted commented-out so the
+    # script never runs anything unattended that still needs operator context.
+    return f"# {line}" if s["gated"] or _suggestion_has_placeholder(s) else line
 
 
 def write_recon_scripts(outdir: Path,
@@ -2828,15 +2893,22 @@ def _ordered_hosts(suggestions: List[Dict[str, Any]]) -> List[str]:
 
 def runnable_suggestions(all_suggestions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Live, unauthenticated, kali-side commands only (never gated/placeholder ones)."""
-    return [s for s in all_suggestions if not s["gated"] and s["shell"] == "bash"]
+    return [
+        s for s in all_suggestions
+        if not s["gated"] and s["shell"] == "bash" and not _suggestion_has_placeholder(s)
+    ]
 
 
 def _print_run_plan(live: List[Dict[str, Any]]) -> None:
-    print(color(f"\nPlan: {len(live)} unauthenticated recon command(s)", C.BOLD))
+    print()
+    print(bold("PathFinder Recon Plan", C.CYAN))
+    print(color(f"  {len(live)} unauthenticated recon command(s) queued", C.GREEN))
     for host in _ordered_hosts(live):
-        print(color(f"  {host}", C.CYAN))
+        host_jobs = [x for x in live if x["host"] == host]
+        print(color(f"\n  Host: {host}  ({len(host_jobs)} task(s))", C.BOLD + C.CYAN))
         for s in [x for x in live if x["host"] == host]:
-            print(f"    {s['tool']:<16} {s['command']}")
+            print(f"    {color(_fit_cell(s['tool'], TOOL_COL_WIDTH), C.BOLD)}  {color(s['group'], C.GREY)}")
+            print(f"      {s['command']}")
 
 
 def _fmt_elapsed(seconds: float) -> str:
@@ -2844,7 +2916,7 @@ def _fmt_elapsed(seconds: float) -> str:
     return f"{total // 60:02d}:{total % 60:02d}"
 
 
-TOOL_COL_WIDTH = 18
+TOOL_COL_WIDTH = 22
 HOST_COL_WIDTH = 15
 STATE_COL_WIDTH = 14
 DEFAULT_STATUS_WIDTH = 120
@@ -2865,17 +2937,20 @@ def _format_job_row(job: Dict[str, Any], now: float, width: int = DEFAULT_STATUS
     state = job["state"]
     disp = {"skip:no-tool": "skip (no tool)", "skip:no-wordlist": "skip (no wl)"}.get(state, state)
     elapsed = _fmt_elapsed((job["end"] or now) - job["start"]) if job["start"] else "--:--"
+    state_color = C.GREEN if state == "done" else C.YELLOW if state in ("running", "queued") else C.RED
+    elapsed_width = 5
+    base_width = 2 + TOOL_COL_WIDTH + 2 + HOST_COL_WIDTH + 2 + STATE_COL_WIDTH + 2 + elapsed_width
     row = (
-        f"  {_fit_cell(job['tool'], TOOL_COL_WIDTH)}"
-        f"  {_fit_cell(job['host'], HOST_COL_WIDTH)}"
-        f"  {_fit_cell(disp, STATE_COL_WIDTH)}"
-        f"  {elapsed}"
+        f"  {color(_fit_cell(job['tool'], TOOL_COL_WIDTH), C.BOLD)}"
+        f"  {color(_fit_cell(job['host'], HOST_COL_WIDTH), C.CYAN)}"
+        f"  {color(_fit_cell(disp, STATE_COL_WIDTH), state_color)}"
+        f"  {color(elapsed, C.GREY)}"
     )
     if state == "running" and job["last"]:
         suffix = "  | "
-        remaining = max(0, width - len(row) - len(suffix))
+        remaining = max(0, width - base_width - len(suffix))
         row += suffix + _fit_cell(_clean_status_line(job["last"]), remaining).rstrip()
-    return row[:width]
+    return row
 
 
 class _LiveTable:
@@ -3061,14 +3136,16 @@ def run_suggestions(all_suggestions: List[Dict[str, Any]],
 
     def build_lines() -> List[str]:
         now = time.time()
-        width = max(80, shutil.get_terminal_size((DEFAULT_STATUS_WIDTH, 20)).columns)
+        # Leave one spare column: some terminals wrap when a line exactly fills
+        # the viewport, which makes the active tool row appear to vanish or smear.
+        width = max(80, shutil.get_terminal_size((DEFAULT_STATUS_WIDTH, 20)).columns - 1)
         running = sum(1 for j in jobs if j["state"] == "running")
         done = sum(1 for j in jobs if j["state"] == "done")
         skipped = sum(1 for j in jobs if j["state"].startswith("skip"))
         other = sum(1 for j in jobs if j["state"] in ("failed", "timed out", "interrupted") or j["state"].startswith("exit"))
-        header = (f"Recon [{len(jobs_by_host)} host lane(s), {PER_HOST_LANE}/host]: "
-                  f"{running} running, {done} done, {skipped} skipped, {other} other")
-        lines = [color(header, C.BOLD)]
+        header = (f"Recon [{len(jobs_by_host)} host lane(s), {PER_HOST_LANE}/host]  "
+                  f"{running} running  {done} done  {skipped} skipped  {other} other")
+        lines = [bold(header, C.CYAN)]
         for j in jobs:
             lines.append(_format_job_row(j, now, width))
         return lines

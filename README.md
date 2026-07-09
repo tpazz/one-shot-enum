@@ -141,9 +141,13 @@ python one-shot-enum.py 10.10.10.10 --suggest
 In the generated script:
 
 - Live (uncommented) lines are unauthenticated recon you can run immediately.
+- If Nmap exposes an AD DNS domain from LDAP/RDP output, unauthenticated
+  Kerbrute/GetNPUsers commands use it automatically and remain live in `--run`.
+- Commands with unresolved placeholders are commented-out with
+  `<domain>`/`<user>`/`<pass>` markers to edit. Kerbrute/GetNPUsers stay
+  commented only when no domain could be inferred.
 - Commands that need credentials or a foothold (LDAP dumps, Kerberoasting,
-  certipy, secretsdump, linpeas/winpeas, SharpHound) are commented-out with
-  `<domain>`/`<user>`/`<pass>` placeholders to edit.
+  certipy, secretsdump, linpeas/winpeas, SharpHound) are also commented-out.
 - Tools whose PathFinder parser is still on the roadmap are tagged
   `parser pending`.
 
