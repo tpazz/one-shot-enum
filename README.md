@@ -55,7 +55,7 @@ Two modes, quick vs rich:
 - `--ai-paths` — the **rich** mode: probe *all* HTTP-like services, fingerprint common AI/ML/RAG components (OpenAI-compatible APIs, Ollama, vLLM, TGI, LangServe, Gradio, agent/MCP, vector stores, MLflow, model servers, Jupyter, workflow builders, image-gen), and print prioritized attack-path next steps. `--ai-paths` is a strict superset of `--llm-endpoint`. With `--suggest`/`--run` it also hands the detected surfaces to PathFinder (see below).
 - `--ai-only` — with `--suggest`/`--run`, focus on AI surfaces **only**: hand the AI enumeration to PathFinder and skip every other recon tool. Implies `--ai-paths`. Use it for a fast, targeted AI-target pass without web/service enumeration noise (`one-shot-enum <target> --ai-only --run`).
 - `--power` — with `--suggest`/`--run`, add the heavier `nuclei` web check. Default web enumeration stays lean with `whatweb`, `ffuf`, `nikto`, and WordPress-only `wpscan`.
-- `--top`, `--min-likelihood`, `--show-all` — with `--run`, pass PathFinder's triage-display controls through to the final attack-path report. PathFinder defaults to grouped output with `--top 20 --min-likelihood low`; use these when a multi-host run gets noisy.
+- `--top`, `--min-likelihood`, `--show-all`, `--ai-brief` — with `--run`, pass PathFinder's triage/reporting controls through to the final attack-path report. PathFinder defaults to grouped output with `--top 20 --min-likelihood low`; use these when a multi-host run gets noisy or when you want a markdown AI attack-intelligence brief.
 - `--ai-active` — **active (still read-only) confirmation** on top of `--ai-paths`: for MCP/A2A surfaces it fetches agent-discovery documents (`/.well-known/agent.json`, `/agents`) and sends the standard MCP JSON-RPC `initialize` + `tools/list` handshake to turn *inferred* capabilities into a *confirmed* tool inventory (each tool categorised as filesystem / code-execution / network-egress / database / secrets / source-control). It never invokes a tool. Implies `--ai-paths`.
 
 When a surface looks like a **vector store** (Qdrant / Chroma / Weaviate / OpenSearch), `--ai-paths` also does a read-only "plaintext first" check: it lists the collections/classes/indices and flags the store if it answers **unauthenticated** — usually the highest-value RAG win, since the source chunks are readable without any embedding inversion.
@@ -186,6 +186,7 @@ python one-shot-enum.py 10.10.10.0/24 --run           # concurrency auto-scales 
 python one-shot-enum.py 10.10.10.0/24 --run --top 10
 python one-shot-enum.py 10.10.10.0/24 --run --min-likelihood medium
 python one-shot-enum.py 10.10.10.0/24 --run --show-all
+python one-shot-enum.py 10.10.10.0/24 --run --ai-brief ai-brief.md
 python one-shot-enum.py 10.10.10.10 --run --run-timeout 300
 python one-shot-enum.py 10.10.10.10 --run --scan-timeout 900
 python one-shot-enum.py 10.10.10.10 --run --loot-dir loot-clientA   # isolate this engagement

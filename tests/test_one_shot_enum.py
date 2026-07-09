@@ -261,6 +261,7 @@ class PathFinderBridgeTests(unittest.TestCase):
                     top=10,
                     min_likelihood="medium",
                     show_all=True,
+                    ai_brief="ai-brief.md",
                 )
             finally:
                 ose.subprocess.run = original_run
@@ -275,6 +276,8 @@ class PathFinderBridgeTests(unittest.TestCase):
             self.assertIn("--min-likelihood", cmd)
             self.assertIn("medium", cmd)
             self.assertIn("--show-all", cmd)
+            self.assertIn("--ai-brief", cmd)
+            self.assertIn("ai-brief.md", cmd)
 
 
 class StaleLootTests(unittest.TestCase):

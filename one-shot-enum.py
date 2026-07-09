@@ -3146,7 +3146,7 @@ def run_suggestions(all_suggestions: List[Dict[str, Any]],
 
 def run_pathfinder(pathfinder_path: str, loot: str, ai_only: bool = False,
                    top: int | None = None, min_likelihood: str | None = None,
-                   show_all: bool = False) -> None:
+                   show_all: bool = False, ai_brief: str | None = None) -> None:
     """Invoke PathFinder's scan mode on the loot directory."""
     pf = Path(pathfinder_path)
     if not (pf / "main" / "pathfinder.py").exists():
@@ -3168,6 +3168,8 @@ def run_pathfinder(pathfinder_path: str, loot: str, ai_only: bool = False,
         cmd.extend(["--min-likelihood", min_likelihood])
     if show_all:
         cmd.append("--show-all")
+    if ai_brief:
+        cmd.extend(["--ai-brief", ai_brief])
     try:
         subprocess.run(cmd, cwd=str(pf))
     except Exception as exc:
@@ -3306,6 +3308,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="With --run, pass through to PathFinder: display every synthesized attack path "
              "instead of grouped triage output",
+    )
+    parser.add_argument(
+        "--ai-brief",
+        metavar="FILE",
+        help="With --run, pass through to PathFinder: write a markdown AI attack-intelligence "
+             "brief to FILE",
     )
     args = parser.parse_args()
     if args.ai_only:
@@ -3628,6 +3636,7 @@ def main() -> None:
             top=args.top,
             min_likelihood=args.min_likelihood,
             show_all=args.show_all,
+            ai_brief=args.ai_brief,
         )
 
 
