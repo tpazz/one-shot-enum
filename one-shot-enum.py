@@ -2354,10 +2354,6 @@ DEFAULT_RUN_IDLE_TIMEOUT = 180
 DEFAULT_SCAN_TIMEOUT = 1800
 NMAP_SCAN_TIMEOUT = DEFAULT_SCAN_TIMEOUT
 
-# OSCP exam profile: suggestion tools restricted on the exam, omitted under --oscp.
-# (Metasploit isn't suggested here; PathFinder handles its one-target reminder.)
-OSCP_PROHIBITED_TOOLS = {"nuclei", "sqlmap"}
-
 WEB_PORTS = {80, 443, 591, 3000, 5000, 8000, 8008, 8080, 8081, 8088, 8180,
              8443, 8444, 8800, 8888, 9000, 9090, 9443}
 WEB_HTTPS_PORTS = {443, 8443, 8444, 9443, 2083, 2087, 2096}
@@ -2513,7 +2509,8 @@ def _lootpath(loot: str, name: str) -> str:
     return shlex.quote(f"{loot}/{name}")
 
 
-def _web_suggestions(host: str, service: Service, loot: str, wordlist: str) -> List[Dict[str, Any]]:
+def _web_suggestions(host: str, service: Service, loot: str, wordlist: str,
+                     power: bool = False) -> List[Dict[str, Any]]:
     scheme = _web_scheme(service)
     port = _svc_port(service)
     base = f"{scheme}://{host}:{port}"
@@ -2523,16 +2520,17 @@ def _web_suggestions(host: str, service: Service, loot: str, wordlist: str) -> L
     out = [
         _suggestion(host, group, "whatweb",
                     f"whatweb -a3 {base} --log-json={_lootpath(loot, f'whatweb_{port}.json')}", "whatweb_json"),
-        _suggestion(host, group, "gobuster",
-                    f"gobuster dir -u {base} -w {wl}{k} -o {_lootpath(loot, f'gobuster_{port}.txt')}", "gobuster_txt"),
         _suggestion(host, group, "ffuf",
                     f"ffuf -u {base}/FUZZ -w {wl}{k} -of json -o {_lootpath(loot, f'ffuf_{port}.json')}",
                     "ffuf_json"),
         _suggestion(host, group, "nikto",
                     f"nikto -h {base} -Format json -o {_lootpath(loot, f'nikto_{port}.json')}", "nikto_json"),
-        _suggestion(host, group, "nuclei",
-                    f"nuclei -u {base} -jsonl -o {_lootpath(loot, f'nuclei_{port}.jsonl')}", "nuclei_jsonl"),
     ]
+    if power:
+        out.extend([
+            _suggestion(host, group, "nuclei",
+                        f"nuclei -u {base} -jsonl -o {_lootpath(loot, f'nuclei_{port}.jsonl')}", "nuclei_jsonl"),
+        ])
     if _looks_wordpress(service):
         out.append(_suggestion(host, group, "wpscan",
                    f"wpscan --url {base} --format json -o {_lootpath(loot, f'wpscan_{port}.json')} --disable-tls-checks",
@@ -2646,7 +2644,8 @@ def suggest_for_host(host: str,
                      udp_services: List[Service],
                      loot: str,
                      wordlist: str,
-                     userlist: str) -> List[Dict[str, Any]]:
+                     userlist: str,
+                     power: bool = False) -> List[Dict[str, Any]]:
     suggestions: List[Dict[str, Any]] = []
     has_smb = False
     has_ad = False
@@ -2661,7 +2660,7 @@ def suggest_for_host(host: str,
     for service in tcp_services:
         port = _svc_port(service)
         if _is_web_service(service):
-            suggestions.extend(_web_suggestions(host, service, host_loot, wordlist))
+            suggestions.extend(_web_suggestions(host, service, host_loot, wordlist, power=power))
         if _svc_name(service) in {"microsoft-ds", "netbios-ssn", "smb"} or port in SMB_PORTS:
             has_smb = True
         if "ldap" in _svc_name(service) or "kerberos" in _svc_name(service) \
@@ -2930,7 +2929,7 @@ def _run_worker(job: Dict[str, Any], lock: threading.Lock, tty: bool) -> None:
             with lock:
                 job["proc"] = proc
             # text mode uses universal newlines, so carriage-return progress lines
-            # from gobuster/ffuf arrive as discrete lines we can tail.
+            # from tools like ffuf arrive as discrete lines we can tail.
             for line in proc.stdout:
                 logf.write(line)
                 stripped = line.strip()
@@ -3114,7 +3113,9 @@ def run_suggestions(all_suggestions: List[Dict[str, Any]],
     }
 
 
-def run_pathfinder(pathfinder_path: str, loot: str, oscp: bool = False) -> None:
+def run_pathfinder(pathfinder_path: str, loot: str, ai_only: bool = False,
+                   top: int | None = None, min_likelihood: str | None = None,
+                   show_all: bool = False) -> None:
     """Invoke PathFinder's scan mode on the loot directory."""
     pf = Path(pathfinder_path)
     if not (pf / "main" / "pathfinder.py").exists():
@@ -3128,8 +3129,14 @@ def run_pathfinder(pathfinder_path: str, loot: str, oscp: bool = False) -> None:
     findings_path = os.path.join(os.path.dirname(loot_abs), "findings.json")
     info(f"Launching PathFinder on {loot_abs} (findings -> {findings_path})")
     cmd = [sys.executable, "-m", "main.pathfinder", "scan", loot_abs, "-o", findings_path]
-    if oscp:
-        cmd.append("--oscp")  # keep the exam-safe profile consistent across the pipeline
+    if ai_only:
+        cmd.append("--ai-only")
+    if top is not None:
+        cmd.extend(["--top", str(top)])
+    if min_likelihood:
+        cmd.extend(["--min-likelihood", min_likelihood])
+    if show_all:
+        cmd.append("--show-all")
     try:
         subprocess.run(cmd, cwd=str(pf))
     except Exception as exc:
@@ -3227,6 +3234,11 @@ def parse_args() -> argparse.Namespace:
              "hand the results to PathFinder. Intended for the Kali/attack host.",
     )
     parser.add_argument(
+        "--power",
+        action="store_true",
+        help="With --suggest/--run, add heavier web checks: nuclei.",
+    )
+    parser.add_argument(
         "--run-timeout",
         type=int,
         default=DEFAULT_RUN_IDLE_TIMEOUT,
@@ -3247,10 +3259,22 @@ def parse_args() -> argparse.Namespace:
              f"fresh dir per engagement so PathFinder never mixes current and stale data",
     )
     parser.add_argument(
-        "--oscp",
+        "--top",
+        type=int,
+        help="With --run, pass through to PathFinder: max grouped attack-path leads to display "
+             "(PathFinder default: 20; 0 = all groups)",
+    )
+    parser.add_argument(
+        "--min-likelihood",
+        choices=["low", "medium", "high"],
+        help="With --run, pass through to PathFinder: only display attack paths at or above "
+             "this triage likelihood (PathFinder default: low)",
+    )
+    parser.add_argument(
+        "--show-all",
         action="store_true",
-        help="OSCP exam profile: omit restricted tools (" + ", ".join(sorted(OSCP_PROHIBITED_TOOLS)) +
-             ") from suggestions/runs, and pass --oscp through to PathFinder",
+        help="With --run, pass through to PathFinder: display every synthesized attack path "
+             "instead of grouped triage output",
     )
     args = parser.parse_args()
     if args.ai_only:
@@ -3261,6 +3285,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--run-timeout must be >= 0.")
     if args.scan_timeout < 0:
         parser.error("--scan-timeout must be >= 0.")
+    if args.top is not None and args.top < 0:
+        parser.error("--top must be >= 0.")
     if args.suggest and args.run:
         parser.error("Use either --suggest or --run, not both.")
     if args.llm_endpoint and args.ai_paths:
@@ -3420,7 +3446,6 @@ def main() -> None:
 
     csv_rows: List[Dict[str, str]] = []
     all_suggestions: List[Dict[str, Any]] = []
-    oscp_omitted: Set[str] = set()
 
     for idx, target in enumerate(targets, start=1):
         print(color(f"[{idx}/{len(targets)}] {target}", C.BOLD))
@@ -3493,16 +3518,8 @@ def main() -> None:
                 host_suggestions = suggest_for_host(
                     loot_host, tcp_services, udp_services,
                     LOOT_DIR, DEFAULT_WEB_WORDLIST, DEFAULT_USER_WORDLIST,
+                    power=args.power,
                 )
-                if args.oscp:
-                    # Drop tools restricted on the OSCP exam (record what we omitted).
-                    kept = []
-                    for s in host_suggestions:
-                        if s["tool"] in OSCP_PROHIBITED_TOOLS:
-                            oscp_omitted.add(s["tool"])
-                        else:
-                            kept.append(s)
-                    host_suggestions = kept
                 if args.suggest:
                     # Use the same pinned host the loot paths are keyed on.
                     print_suggestions(loot_host, host_suggestions)
@@ -3545,17 +3562,10 @@ def main() -> None:
     else:
         good("Done.")
 
-    if args.oscp and (args.suggest or args.run):
-        if oscp_omitted:
-            warn(f"OSCP profile: omitted restricted tool(s): {', '.join(sorted(oscp_omitted))} "
-                 f"(not suggested/run on the exam).")
-        else:
-            info("OSCP profile active: no restricted tools were applicable to these hosts.")
-
     if args.suggest:
         if args.ai_only:
             good(f"AI-only mode: AI surfaces written under {LOOT_DIR}/. "
-                 f"Next: `{PATHFINDER_SCAN_CMD} {LOOT_DIR}/`")
+                 f"Next: `{PATHFINDER_SCAN_CMD} {LOOT_DIR}/ --ai-only`")
         elif all_suggestions:
             script_dir = base_outdir if (args.save and base_outdir) else Path(".")
             try:
@@ -3581,7 +3591,13 @@ def main() -> None:
         # Always analyse with PathFinder (in --ai-only there are no tool commands,
         # but the AI surfaces were handed off for analysis).
         pathfinder_path = str(Path(__file__).resolve().parent.parent / "PathFinder")
-        run_pathfinder(pathfinder_path, LOOT_DIR, oscp=args.oscp)
+        run_pathfinder(
+            pathfinder_path, LOOT_DIR,
+            ai_only=args.ai_only,
+            top=args.top,
+            min_likelihood=args.min_likelihood,
+            show_all=args.show_all,
+        )
 
 
 if __name__ == "__main__":

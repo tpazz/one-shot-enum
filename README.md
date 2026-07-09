@@ -53,7 +53,9 @@ Two modes, quick vs rich:
 
 - `--llm-endpoint` — a **quick, read-only peek**: detect LLM/API-like HTTP services and list their discovered OpenAPI endpoints. No path probing, no PathFinder handoff.
 - `--ai-paths` — the **rich** mode: probe *all* HTTP-like services, fingerprint common AI/ML/RAG components (OpenAI-compatible APIs, Ollama, vLLM, TGI, LangServe, Gradio, agent/MCP, vector stores, MLflow, model servers, Jupyter, workflow builders, image-gen), and print prioritized attack-path next steps. `--ai-paths` is a strict superset of `--llm-endpoint`. With `--suggest`/`--run` it also hands the detected surfaces to PathFinder (see below).
-- `--ai-only` — with `--suggest`/`--run`, focus on AI surfaces **only**: hand the AI enumeration to PathFinder and skip every other recon tool. Implies `--ai-paths`. Use it for a fast, targeted AI-target pass without gobuster/nikto/SMB/etc. noise (`one-shot-enum <target> --ai-only --run`).
+- `--ai-only` — with `--suggest`/`--run`, focus on AI surfaces **only**: hand the AI enumeration to PathFinder and skip every other recon tool. Implies `--ai-paths`. Use it for a fast, targeted AI-target pass without web/service enumeration noise (`one-shot-enum <target> --ai-only --run`).
+- `--power` — with `--suggest`/`--run`, add the heavier `nuclei` web check. Default web enumeration stays lean with `whatweb`, `ffuf`, `nikto`, and WordPress-only `wpscan`.
+- `--top`, `--min-likelihood`, `--show-all` — with `--run`, pass PathFinder's triage-display controls through to the final attack-path report. PathFinder defaults to grouped output with `--top 20 --min-likelihood low`; use these when a multi-host run gets noisy.
 - `--ai-active` — **active (still read-only) confirmation** on top of `--ai-paths`: for MCP/A2A surfaces it fetches agent-discovery documents (`/.well-known/agent.json`, `/agents`) and sends the standard MCP JSON-RPC `initialize` + `tools/list` handshake to turn *inferred* capabilities into a *confirmed* tool inventory (each tool categorised as filesystem / code-execution / network-egress / database / secrets / source-control). It never invokes a tool. Implies `--ai-paths`.
 
 When a surface looks like a **vector store** (Qdrant / Chroma / Weaviate / OpenSearch), `--ai-paths` also does a read-only "plaintext first" check: it lists the collections/classes/indices and flags the store if it answers **unauthenticated** — usually the highest-value RAG win, since the source chunks are readable without any embedding inversion.
@@ -120,12 +122,17 @@ services into the right follow-up commands for it, in two modes — pick one.
 
 ### `--suggest`
 
-Prints the next-step enumeration commands for each discovered service (gobuster,
-ffuf, nikto, whatweb, nuclei, wpscan, enum4linux-ng, smbmap, netexec,
+Prints the next-step enumeration commands for each discovered service (whatweb,
+ffuf, nikto, WordPress-only wpscan, enum4linux-ng, smbmap, netexec,
 snmp-check, showmount/NFS, redis-cli, rsync, smtp-user-enum, kerbrute,
 GetNPUsers, and more), with output flags that PathFinder's
 `scan` auto-detector understands, and writes a runnable `pathfinder_recon.sh`
 (plus `pathfinder_recon.ps1` for Windows post-foothold steps).
+
+Default web enumeration is intentionally lean. Add `--power` to include the
+heavier `nuclei` check in the suggestions and live runs. `sqlmap` output is
+still supported by PathFinder as a parser input, but one-shot-enum does not fire
+generic sqlmap runs.
 
 ```bash
 python one-shot-enum.py 10.10.10.10 --suggest
@@ -157,7 +164,7 @@ correlates credentials across them:
 loot/
 ├── 10.10.10.10/
 │   ├── nmap.xml
-│   ├── gobuster_80.txt
+│   ├── ffuf_80.json
 │   └── nxc_10.10.10.10.log
 └── 10.10.10.20/
     ├── nmap.xml
@@ -174,7 +181,11 @@ post-foothold commands are never executed. Intended for the Kali/attack host
 
 ```bash
 python one-shot-enum.py 10.10.10.10 --run
+python one-shot-enum.py 10.10.10.10 --run --power   # add nuclei
 python one-shot-enum.py 10.10.10.0/24 --run           # concurrency auto-scales to hosts
+python one-shot-enum.py 10.10.10.0/24 --run --top 10
+python one-shot-enum.py 10.10.10.0/24 --run --min-likelihood medium
+python one-shot-enum.py 10.10.10.0/24 --run --show-all
 python one-shot-enum.py 10.10.10.10 --run --run-timeout 300
 python one-shot-enum.py 10.10.10.10 --run --scan-timeout 900
 python one-shot-enum.py 10.10.10.10 --run --loot-dir loot-clientA   # isolate this engagement
@@ -197,9 +208,8 @@ progress line:
 
 ```
 Recon [2 host lane(s), 2/host]: 3 running, 2 done, 1 skipped, 0 other
-  gobuster    10.10.10.10   running   00:42  | Progress: 4120 / 87664
   ffuf        10.10.10.10   running   00:42  | :: 38200/220560 :: 900 req/s
-  nuclei      10.10.10.20   running   00:41  | [info] templates 1200/5000
+  nikto       10.10.10.20   running   00:41  | + Server leaks inodes via ETags
   whatweb     10.10.10.10   done      00:03
   smbmap      10.10.10.20   skip (no tool)   --:--
 ```
@@ -212,20 +222,6 @@ disable. `--scan-timeout` sets the wall-clock ceiling for each Nmap invocation
 the initial discovery/service-scan stage. Each tool's full output is captured to
 `loot/_logs/<tool>_<host>_<idx>.log` so
 nothing is lost and failures stay diagnosable.
-
-### OSCP profile
-
-`--oscp` (works with `--suggest` or `--run`) omits tools restricted on the OSCP
-exam — currently **nuclei** and **sqlmap** — from the suggestions and runs, and
-prints what it left out. With `--run` it also passes `--oscp` through to
-PathFinder, so the whole pipeline stays exam-safe from a single flag:
-
-```bash
-python one-shot-enum.py 10.10.10.10 --run --oscp
-```
-
-Metasploit isn't suggested here; PathFinder adds its one-target reminder.
-Exam rules change — always verify against the current PEN-200 guide.
 
 ## Requirements
 

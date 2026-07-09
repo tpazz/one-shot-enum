@@ -1,7 +1,7 @@
 """Unit tests for one-shot-enum's pure logic (no network).
 
-Covers target expansion, port parsing, AI-surface / agent-profile inference, OSCP
-filtering, loot paths, stale-loot detection, and - most importantly - that
+Covers target expansion, port parsing, AI-surface / agent-profile inference,
+loot paths, stale-loot detection, and - most importantly - that
 write_llm_enum_loot() emits JSON that PathFinder's llm_enum parser accepts (the
 handoff seam between the two tools).
 
@@ -118,30 +118,44 @@ class AgentProfileInferenceTests(unittest.TestCase):
         self.assertEqual(self._profile(["/index.html"]), {})
 
 
-class OscpFilteringTests(unittest.TestCase):
-    def test_prohibited_set(self):
-        self.assertEqual(ose.OSCP_PROHIBITED_TOOLS, {"nuclei", "sqlmap"})
-
-    def test_filtering_removes_only_prohibited(self):
-        suggestions = [{"tool": "gobuster"}, {"tool": "nuclei"}, {"tool": "whatweb"}, {"tool": "sqlmap"}]
-        kept = [s for s in suggestions if s["tool"] not in ose.OSCP_PROHIBITED_TOOLS]
-        self.assertEqual([s["tool"] for s in kept], ["gobuster", "whatweb"])
-
-
 class GeneratedCommandTests(unittest.TestCase):
     """Generated bash commands: redirected tools use tee (so the --run idle-timeout
     sees output), and operator-controlled paths are shlex-quoted."""
 
-    def _commands(self, loot="loot", wordlist="/wl.txt"):
-        web = make_service(port=80, service="http")
+    def _commands(self, loot="loot", wordlist="/wl.txt", power=False, web_service=None):
+        web = web_service or make_service(port=80, service="http")
         smb = make_service(port=445, service="microsoft-ds")
         nfs = make_service(port=2049, service="nfs")
         redis = make_service(port=6379, service="redis")
         rsync = make_service(port=873, service="rsync")
         smtp = make_service(port=25, service="smtp")
         snmp = make_service(port=161, service="snmp", protocol="udp")
-        sugg = ose.suggest_for_host("10.0.0.5", [web, smb, nfs, redis, rsync, smtp], [snmp], loot, wordlist, "/users.txt")
+        sugg = ose.suggest_for_host("10.0.0.5", [web, smb, nfs, redis, rsync, smtp], [snmp],
+                                    loot, wordlist, "/users.txt", power=power)
         return {s["tool"]: s["command"] for s in sugg}
+
+    def test_default_web_commands_are_lean(self):
+        cmds = self._commands()
+        self.assertIn("ffuf", cmds)
+        self.assertIn("nikto", cmds)
+        self.assertIn("whatweb", cmds)
+        self.assertNotIn("gobuster", cmds)
+        self.assertNotIn("wpscan", cmds)
+        self.assertNotIn("nuclei", cmds)
+        self.assertNotIn("sqlmap", cmds)
+
+    def test_wordpress_detection_adds_wpscan(self):
+        wp = make_service(port=80, service="http", scripts="http-wordpress-users wp-content")
+        cmds = self._commands(web_service=wp)
+        self.assertIn("wpscan", cmds)
+        self.assertIn("wpscan --url http://10.0.0.5:80", cmds["wpscan"])
+        self.assertIn("loot/10.0.0.5/wpscan_80.json", cmds["wpscan"])
+
+    def test_power_adds_nuclei_only(self):
+        cmds = self._commands(power=True)
+        self.assertIn("nuclei -u http://10.0.0.5:80", cmds["nuclei"])
+        self.assertIn("loot/10.0.0.5/nuclei_80.jsonl", cmds["nuclei"])
+        self.assertNotIn("sqlmap", cmds)
 
     def test_smbmap_and_snmpcheck_use_tee_not_redirect(self):
         cmds = self._commands()
@@ -172,18 +186,18 @@ class GeneratedCommandTests(unittest.TestCase):
     def test_loot_dir_with_spaces_is_quoted(self):
         cmds = self._commands(loot="my loot")
         # shlex.quote wraps a spaced path in single quotes so it stays one argument.
-        self.assertIn("'my loot", cmds["gobuster"])
+        self.assertIn("'my loot", cmds["ffuf"])
         self.assertIn("'my loot", cmds["smbmap"])
 
     def test_wordlist_with_spaces_is_quoted(self):
         cmds = self._commands(wordlist="/opt/word lists/raft.txt")
-        self.assertIn("'/opt/word lists/raft.txt'", cmds["gobuster"])
+        self.assertIn("'/opt/word lists/raft.txt'", cmds["ffuf"])
 
     def test_default_paths_are_not_over_quoted(self):
         # Clean default paths need no quoting - shlex.quote leaves them bare.
         cmds = self._commands()
-        self.assertIn("loot/10.0.0.5/gobuster_80.txt", cmds["gobuster"])
-        self.assertNotIn("'loot", cmds["gobuster"])
+        self.assertIn("loot/10.0.0.5/ffuf_80.json", cmds["ffuf"])
+        self.assertNotIn("'loot", cmds["ffuf"])
 
     def test_run_worker_preserves_piped_command_exit_status_on_posix(self):
         command, executable = ose._command_with_pipefail(
@@ -211,6 +225,42 @@ class LootPathTests(unittest.TestCase):
 
     def test_safe_name_preserves_ip(self):
         self.assertEqual(ose.safe_name("10.10.10.5"), "10.10.10.5")
+
+
+class PathFinderBridgeTests(unittest.TestCase):
+    def test_run_pathfinder_passes_display_flags(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            pf = root / "PathFinder"
+            (pf / "main").mkdir(parents=True)
+            (pf / "main" / "pathfinder.py").write_text("", encoding="utf-8")
+            loot = root / "loot"
+            loot.mkdir()
+
+            calls = []
+            original_run = ose.subprocess.run
+            ose.subprocess.run = lambda cmd, cwd=None: calls.append((cmd, cwd))
+            try:
+                ose.run_pathfinder(
+                    str(pf), str(loot),
+                    ai_only=True,
+                    top=10,
+                    min_likelihood="medium",
+                    show_all=True,
+                )
+            finally:
+                ose.subprocess.run = original_run
+
+            self.assertEqual(len(calls), 1)
+            cmd, cwd = calls[0]
+            self.assertEqual(cwd, str(pf))
+            self.assertNotIn("--oscp", cmd)
+            self.assertIn("--ai-only", cmd)
+            self.assertIn("--top", cmd)
+            self.assertIn("10", cmd)
+            self.assertIn("--min-likelihood", cmd)
+            self.assertIn("medium", cmd)
+            self.assertIn("--show-all", cmd)
 
 
 class StaleLootTests(unittest.TestCase):
