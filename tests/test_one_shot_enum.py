@@ -9,12 +9,15 @@ Run:  python -m pytest tests/    (or  python -m unittest discover tests)
 """
 
 import importlib.util
+import io
 import json
 import os
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 
 # one-shot-enum.py has a hyphen, so load it by path rather than importing.
 ROOT = Path(__file__).resolve().parent.parent
@@ -304,6 +307,98 @@ class GeneratedCommandTests(unittest.TestCase):
         self.assertIn("impacket-GetNPUsers", row)
         self.assertIn("192.168.102.13", row)
 
+    def test_status_line_strips_terminal_controls_from_ffuf_progress(self):
+        cleaned = ose._clean_status_line(
+            "\x1b[2K\r:: Progress: [2440/29999] :: Job [1/1] :: 2 req/sec :: Duration: ["
+        )
+        self.assertNotIn("\x1b", cleaned)
+        self.assertNotIn("\r", cleaned)
+        self.assertIn("Progress", cleaned)
+
+    def test_running_status_row_has_marker_without_shifting_tool_name(self):
+        running = ose._format_job_row({
+            "tool": "ffuf",
+            "host": "192.168.102.13",
+            "state": "running",
+            "last": "",
+            "start": 90.0,
+            "end": None,
+        }, now=100.0, width=90)
+        done = ose._format_job_row({
+            "tool": "ffuf",
+            "host": "192.168.102.13",
+            "state": "done",
+            "last": "",
+            "start": 90.0,
+            "end": 100.0,
+        }, now=100.0, width=90)
+
+        self.assertTrue(running.startswith("> ffuf"))
+        self.assertTrue(done.startswith("  ffuf"))
+        self.assertEqual(running.index("ffuf"), done.index("ffuf"))
+
+    def test_run_scheduler_keeps_two_same_host_jobs_active_until_tail(self):
+        suggestions = [
+            {
+                "host": "10.0.0.5",
+                "group": "test",
+                "tool": f"tool{i}",
+                "command": f"fake-tool job{i}",
+                "parser": "test_parser",
+                "pending": False,
+                "gated": False,
+                "shell": "bash",
+                "note": "",
+            }
+            for i in range(4)
+        ]
+        active = 0
+        max_active = 0
+        starts = []
+        probe_lock = ose.threading.Lock()
+
+        def fake_worker(job, lock, tty):
+            nonlocal active, max_active
+            with lock:
+                job["state"] = "running"
+                job["start"] = ose.time.time()
+                job["last_output"] = job["start"]
+            with probe_lock:
+                active += 1
+                max_active = max(max_active, active)
+                starts.append(job["tool"])
+            ose.time.sleep(0.05)
+            with probe_lock:
+                active -= 1
+            with lock:
+                job["rc"] = 0
+                job["end"] = ose.time.time()
+                job["state"] = "done"
+
+        original_worker = ose._run_worker
+        original_which = ose.shutil.which
+        original_plan = ose._print_run_plan
+        ose._run_worker = fake_worker
+        ose.shutil.which = lambda _binary: "fake-tool"
+        ose._print_run_plan = lambda _live: None
+        try:
+            with tempfile.TemporaryDirectory() as d, redirect_stdout(io.StringIO()):
+                result = ose.run_suggestions(
+                    suggestions,
+                    d,
+                    "wordlist-not-in-command",
+                    "userlist-not-in-command",
+                    idle_timeout=0,
+                )
+        finally:
+            ose._run_worker = original_worker
+            ose.shutil.which = original_which
+            ose._print_run_plan = original_plan
+
+        self.assertEqual(result["ran"], 4)
+        self.assertEqual(max_active, ose.PER_HOST_LANE)
+        self.assertEqual(starts, ["tool0", "tool1", "tool2", "tool3"])
+
 
 class LootPathTests(unittest.TestCase):
     def test_host_loot_dir(self):
@@ -314,7 +409,7 @@ class LootPathTests(unittest.TestCase):
 
 
 class PathFinderBridgeTests(unittest.TestCase):
-    def test_run_pathfinder_passes_display_flags(self):
+    def test_run_pathfinder_passes_scan_flags(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             pf = root / "PathFinder"
@@ -322,6 +417,8 @@ class PathFinderBridgeTests(unittest.TestCase):
             (pf / "main" / "pathfinder.py").write_text("", encoding="utf-8")
             loot = root / "loot"
             loot.mkdir()
+            out = root / "custom_findings.json"
+            cache = root / "github_cache.json"
 
             calls = []
             original_run = ose.subprocess.run
@@ -329,11 +426,19 @@ class PathFinderBridgeTests(unittest.TestCase):
             try:
                 ose.run_pathfinder(
                     str(pf), str(loot),
-                    ai_only=True,
                     top=10,
                     min_likelihood="medium",
                     show_all=True,
-                    ai_brief="ai-brief.md",
+                    target_host="10.0.0.5",
+                    output_json=str(out),
+                    verbose=2,
+                    max_vulns=25,
+                    offline=True,
+                    skip_github=True,
+                    skip_searchsploit=True,
+                    github_cache=str(cache),
+                    no_color=True,
+                    oscp=True,
                 )
             finally:
                 ose.subprocess.run = original_run
@@ -341,15 +446,122 @@ class PathFinderBridgeTests(unittest.TestCase):
             self.assertEqual(len(calls), 1)
             cmd, cwd = calls[0]
             self.assertEqual(cwd, str(pf))
-            self.assertNotIn("--oscp", cmd)
-            self.assertIn("--ai-only", cmd)
+            self.assertIn(str(out), cmd)
+            self.assertIn("--target-host", cmd)
+            self.assertIn("10.0.0.5", cmd)
+            self.assertEqual(cmd.count("-v"), 2)
+            self.assertIn("--max-vulns", cmd)
+            self.assertIn("25", cmd)
+            self.assertIn("--offline", cmd)
+            self.assertIn("--skip-github", cmd)
+            self.assertIn("--skip-searchsploit", cmd)
+            self.assertIn("--github-cache", cmd)
+            self.assertIn(str(cache), cmd)
+            self.assertIn("--no-color", cmd)
+            self.assertIn("--oscp", cmd)
+            self.assertNotIn("--ai-only", cmd)
+            self.assertNotIn("--ai-brief", cmd)
             self.assertIn("--top", cmd)
             self.assertIn("10", cmd)
             self.assertIn("--min-likelihood", cmd)
             self.assertIn("medium", cmd)
             self.assertIn("--show-all", cmd)
-            self.assertIn("--ai-brief", cmd)
-            self.assertIn("ai-brief.md", cmd)
+
+    def test_default_uses_full_active_ai_options(self):
+        opts = ose._llm_enum_options(SimpleNamespace(pathfinder=False, llm_endpoint=False))
+
+        self.assertEqual(opts, {
+            "endpoint_only": False,
+            "probe_all_http": True,
+            "ai_paths_mode": True,
+            "active": True,
+        })
+
+    def test_suggest_uses_full_active_ai_options(self):
+        opts = ose._llm_enum_options(SimpleNamespace(pathfinder_suggest=True, pathfinder=False, llm_endpoint=False))
+
+        self.assertEqual(opts, {
+            "endpoint_only": False,
+            "probe_all_http": True,
+            "ai_paths_mode": True,
+            "active": True,
+        })
+
+    def test_llm_endpoint_remains_quick_ai_peek(self):
+        opts = ose._llm_enum_options(SimpleNamespace(pathfinder=False, llm_endpoint=True))
+
+        self.assertEqual(opts, {
+            "endpoint_only": True,
+            "probe_all_http": False,
+            "ai_paths_mode": False,
+            "active": False,
+        })
+
+    def test_llm_endpoint_can_override_pathfinder_mode(self):
+        original_argv = sys.argv
+        try:
+            sys.argv = ["one-shot-enum.py", "10.0.0.5", "--pathfinder", "--llm-endpoint"]
+            args = ose.parse_args()
+        finally:
+            sys.argv = original_argv
+
+        self.assertTrue(args.pathfinder)
+        self.assertTrue(args.llm_endpoint)
+
+    def test_old_pathfinder_and_ai_mode_flags_are_not_accepted(self):
+        original_argv = sys.argv
+        try:
+            for flag in ("--run", "--suggest", "--ai-paths", "--ai-active", "--ai-only", "--ai-brief"):
+                sys.argv = ["one-shot-enum.py", "10.0.0.5", flag]
+                with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
+                    ose.parse_args()
+        finally:
+            sys.argv = original_argv
+
+    def test_pathfinder_only_flags_require_pathfinder_mode(self):
+        original_argv = sys.argv
+        try:
+            for extra in (
+                ["--max-vulns", "0"],
+                ["--offline"],
+                ["--target-host", "10.0.0.5"],
+                ["--output-json", "findings.json"],
+                ["--top", "10"],
+            ):
+                sys.argv = ["one-shot-enum.py", "10.0.0.5", *extra]
+                with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
+                    ose.parse_args()
+        finally:
+            sys.argv = original_argv
+
+    def test_pathfinder_flags_parse_with_pathfinder_mode(self):
+        original_argv = sys.argv
+        try:
+            sys.argv = [
+                "one-shot-enum.py", "10.0.0.5", "--pathfinder",
+                "--max-vulns", "0",
+                "--offline", "--skip-github", "--skip-searchsploit",
+                "--github-cache", "cache.json", "--target-host", "10.0.0.5",
+                "--output-json", "findings.json", "-vv", "--oscp",
+                "--top", "10", "--min-likelihood", "medium", "--show-all",
+            ]
+            args = ose.parse_args()
+        finally:
+            sys.argv = original_argv
+
+        self.assertTrue(args.pathfinder)
+        self.assertEqual(args.max_vulns, 0)
+        self.assertTrue(args.offline)
+        self.assertTrue(args.skip_github)
+        self.assertTrue(args.skip_searchsploit)
+        self.assertEqual(args.github_cache, "cache.json")
+        self.assertEqual(args.target_host, "10.0.0.5")
+        self.assertEqual(args.output_json, "findings.json")
+        self.assertEqual(args.verbose, 2)
+        self.assertTrue(args.oscp)
+        self.assertEqual(args.top, 10)
+        self.assertEqual(args.min_likelihood, "medium")
+        self.assertTrue(args.show_all)
 
 
 class StaleLootTests(unittest.TestCase):

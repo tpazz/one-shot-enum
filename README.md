@@ -1,238 +1,171 @@
 # one-shot-enum
 
-`one-shot-enum.py` is a lightweight wrapper around `nmap` for quick first-pass pentest enumeration. It expands common target formats, finds open TCP ports, runs targeted service enumeration, and prints a clean per-host summary.
+`one-shot-enum.py` is a fast first-pass enumeration wrapper around Nmap. It
+expands targets, finds open ports, fingerprints services, performs read-only
+AI/ML/RAG surface checks by default, and can hand the loot straight to
+PathFinder.
 
-It is designed to be fast and effective: it uses multithreaded target scanning and quick initial TCP port sweeps to identify exposed services first, then drills into detailed enumeration only on the ports that are actually open.
-
-## How it works
-
-The tool runs in two main TCP stages:
-
-1. Host and TCP port discovery with `nmap -Pn -p- --open`, or with the ports supplied via `--ports`.
-2. Targeted service enumeration with `nmap -sC -sV` against only the open TCP ports.
-
-It can also run a UDP top-ports scan, save raw XML and summaries, and perform optional LLM/API endpoint checks against HTTP-like services. If `nmap` is not installed, localhost-only scans can fall back to a pure-Python TCP/service probe.
-
-This staged approach keeps broad scans quick while avoiding wasted service enumeration against closed ports.
-
-## Usage
+## Quick Start
 
 ```bash
 python one-shot-enum.py 10.10.10.5
 python one-shot-enum.py 10.10.10.0/24 --threads 20
 python one-shot-enum.py 10.10.10.10-20 --ports 22,80,443,8000-8010
-python one-shot-enum.py localhost --llm-endpoint
-python one-shot-enum.py 10.10.10.5 --llm-endpoint --save
-python one-shot-enum.py 10.10.10.5 --ai-paths
+python one-shot-enum.py 10.10.10.5 --pathfinder
+python one-shot-enum.py 10.10.10.5 --pathfinder-suggest
 ```
 
-Supported targets:
+Target formats:
 
-- Single IPv4 addresses, such as `10.10.10.5`
-- CIDR ranges, such as `10.10.10.0/24`
-- Short ranges, such as `10.10.10.10-20`
-- Full ranges, such as `10.10.10.10-10.10.10.30`
+- Single IPv4: `10.10.10.5`
+- CIDR: `10.10.10.0/24`
+- Short range: `10.10.10.10-20`
+- Full range: `10.10.10.10-10.10.10.30`
 - `localhost`
 
-## Features
+## What It Does
 
-- Full TCP port discovery by default
-- Optional targeted TCP scans with `--ports`
-- Best-effort OS and host fingerprinting before the `-Pn` scan path
-- Targeted TCP service enumeration with default scripts and version detection
-- Optional UDP top-ports scanning with `--udp`
-- Concurrent stage-1 scanning with `--threads`
-- Live progress output from `nmap`
-- Optional saved output with `--save`, including per-host reports, XML, and a CSV summary
-- Colorized terminal output, disabled with `--no-color`
-- Localhost fallback mode when `nmap` is unavailable
+1. Runs TCP discovery with `nmap -Pn -p- --open` unless `--ports` is supplied.
+2. Runs targeted service enum with `nmap -sC -sV` against open ports only.
+3. Runs full read-only AI/ML/RAG enumeration on HTTP-like services by default.
+4. Optionally writes loot and launches PathFinder.
 
-## LLM/AI enumeration
+Use `--llm-endpoint` when you only want the older quick OpenAPI-style peek. That
+mode skips rich path probing, active MCP/A2A confirmation, and AI loot handoff.
 
-Two modes, quick vs rich:
+## PathFinder Modes
 
-- `--llm-endpoint` — a **quick, read-only peek**: detect LLM/API-like HTTP services and list their discovered OpenAPI endpoints. No path probing, no PathFinder handoff.
-- `--ai-paths` — the **rich** mode: probe *all* HTTP-like services, fingerprint common AI/ML/RAG components (OpenAI-compatible APIs, Ollama, vLLM, TGI, LangServe, Gradio, agent/MCP, vector stores, MLflow, model servers, Jupyter, workflow builders, image-gen), and print prioritized attack-path next steps. `--ai-paths` is a strict superset of `--llm-endpoint`. With `--suggest`/`--run` it also hands the detected surfaces to PathFinder (see below).
-- `--ai-only` — with `--suggest`/`--run`, focus on AI surfaces **only**: hand the AI enumeration to PathFinder and skip every other recon tool. Implies `--ai-paths`. Use it for a fast, targeted AI-target pass without web/service enumeration noise (`one-shot-enum <target> --ai-only --run`).
-- `--power` — with `--suggest`/`--run`, add the heavier `nuclei` web check. Default web enumeration stays lean with `whatweb`, `ffuf`, `nikto`, and WordPress-only `wpscan`.
-- `--top`, `--min-likelihood`, `--show-all`, `--ai-brief` — with `--run`, pass PathFinder's triage/reporting controls through to the final attack-path report. PathFinder defaults to grouped output with `--top 20 --min-likelihood low`; use these when a multi-host run gets noisy or when you want a markdown AI attack-intelligence brief.
-- `--ai-active` — **active (still read-only) confirmation** on top of `--ai-paths`: for MCP/A2A surfaces it fetches agent-discovery documents (`/.well-known/agent.json`, `/agents`) and sends the standard MCP JSON-RPC `initialize` + `tools/list` handshake to turn *inferred* capabilities into a *confirmed* tool inventory (each tool categorised as filesystem / code-execution / network-egress / database / secrets / source-control). It never invokes a tool. Implies `--ai-paths`.
-
-When a surface looks like a **vector store** (Qdrant / Chroma / Weaviate / OpenSearch), `--ai-paths` also does a read-only "plaintext first" check: it lists the collections/classes/indices and flags the store if it answers **unauthenticated** — usually the highest-value RAG win, since the source chunks are readable without any embedding inversion.
-
-Beyond the framework fingerprint, `--ai-paths` also profiles the **agent itself** from its endpoint names — its role, its architecture (topology), and, where a path fingerprint gives it away, its orchestration framework:
-
-- **Role** — the most security-relevant capability, e.g. *Code / Execution agent*, *A2A / multi-agent system*, *MCP / tool server*, *Embedding / vector store*, *Knowledge Base / RAG agent*, *Database / NL-to-SQL agent*, *Tool-using single agent*, *Conversational agent / chatbot*.
-- **Architecture** — the KB/RAG-vs-Single-vs-Multi bucket from the AI-red-team playbook: `multi-agent` (A2A / orchestrator), `tool-server` (MCP), `vector-store` (embedding DB), `rag`, or `single-agent`.
-- **Framework** — Google A2A, Model Context Protocol, LangGraph, CrewAI, or OpenAI Swarm when their route fingerprints (`/.well-known/agent.json`, `/mcp`, `/threads`+`/runs`+`/assistants`, `/kickoff`, `/swarm`, …) are present.
-
-For example, a service exposing `/kb/*`, `/browse`, `/upload`, and `/chat` is flagged as a **Knowledge Base / RAG agent** (`rag`) with `web-browsing`, `file-processing`, `tool-calling`, and `database` capabilities; one exposing `/.well-known/agent.json` and `/agents/register` is an **A2A / multi-agent system**. The security-relevant capabilities (code-execution, tool-calling, mcp-tooling, orchestration, agent-discovery) are highlighted. This profile is shown inline and handed to PathFinder even when the service matches no known framework (custom FastAPI agents, etc.), where it drives archetype-specific attack paths.
-
-Enumeration is read-only — it fingerprints and lists; it never sends prompts to a model. Prompt injection / jailbreak testing is left to you (PathFinder's AI rules point you at it).
-
-Current fingerprints include:
-
-- OpenAI-compatible APIs, vLLM, TGI, Ollama, LangServe, and Gradio
-- MCP and agent discovery surfaces
-- RAG/vector stores such as Qdrant, Chroma, Weaviate, OpenSearch, and Elasticsearch
-- MinIO / S3-compatible object stores that commonly back MLflow and model-artifact pipelines
-- MLflow, TorchServe, Triton, BentoML, TensorFlow Serving, and generic model-serving APIs
-- Jupyter, Flowise, Dify, AnythingLLM, Stable Diffusion WebUI, and ComfyUI
-
-Example:
+`--pathfinder-suggest` prints follow-up commands and writes runnable recon
+scripts:
 
 ```bash
-python one-shot-enum.py 10.10.10.5 --ports 80,443,8000-9000 --ai-paths --save
+python one-shot-enum.py 10.10.10.10 --pathfinder-suggest
 ```
 
-The output keeps the raw evidence visible, then adds an `AI attack pathfinder` block with the inferred surface and the next practical checks, such as model listing, schema recovery, RAG/vector collection enumeration, agent/tool manifest review, or safe test prompts.
-
-### Handoff to PathFinder
-
-The inline `AI attack pathfinder` block is for immediate triage during the scan.
-For prioritized, correlated, reportable attack paths, combine `--ai-paths` with
-`--suggest`/`--run`: each host's detected AI surfaces are written to
-`loot/<host>/llm_enum_<port>.json`, which [PathFinder](../PathFinder) ingests as
-`ai_service` findings and maps to OWASP-LLM-aligned attack paths (prompt
-injection, agent/tool abuse, RAG poisoning, MLflow/Jupyter RCE, and more) —
-scored and deduped alongside the rest of the engagement.
+`--pathfinder` runs unauthenticated recon tools into `loot/`, then launches the
+sibling `../PathFinder` checkout:
 
 ```bash
-python one-shot-enum.py 10.10.10.5 --ports 80,443,8000-9000 --ai-paths --run
+python one-shot-enum.py 10.10.10.10 --pathfinder
+python one-shot-enum.py 10.10.10.10 --pathfinder --power
+python one-shot-enum.py 10.10.10.0/24 --pathfinder --top 10
+python one-shot-enum.py 10.10.10.0/24 --pathfinder --min-likelihood medium
+python one-shot-enum.py 10.10.10.0/24 --pathfinder --offline
 ```
 
-This keeps the division clean: one-shot-enum does the live AI *enumeration*;
-PathFinder does the attack-path *synthesis*.
+PathFinder pass-through flags supported by one-shot-enum:
 
-## Output
+- `--target-host`
+- `-o` / `--output-json`
+- `-v` / `-vv`
+- `--max-vulns`
+- `--offline`
+- `--skip-github`
+- `--skip-searchsploit`
+- `--github-cache`
+- `--no-color`
+- `--oscp`
+- `--top`
+- `--min-likelihood`
+- `--show-all`
 
-By default, results are printed to the terminal only. With `--save`, results are written under `scan_results/` unless changed with `--outdir`.
+`--target-host` is rarely needed because one-shot-enum writes a per-host loot
+layout that PathFinder can attribute automatically.
 
-Saved output includes:
+## Defaults
 
-- Per-host scan XML
-- Per-host `summary.txt`
-- Top-level `services_summary.csv`
+- Loot directory: `loot/`
+- Findings JSON: `findings.json` next to the loot directory
+- Web wordlist: `/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt`
+- User wordlist: `/usr/share/seclists/Usernames/top-usernames-shortlist.txt`
+- Per-host recon concurrency: 2 tools
+- Tool idle timeout: `--run-timeout 180`
+- Nmap timeout: `--scan-timeout 1800`
+- Default web tools: WhatWeb, ffuf, Nikto, plus WPScan only when WordPress is detected
+- `--power`: adds nuclei
+- SQLMap: never fired automatically; PathFinder can parse SQLMap logs you provide
 
-## PathFinder integration
+If a recon tool or wordlist is missing, `--pathfinder` skips that task and keeps
+going. Full per-tool logs are written under `loot/_logs/`.
 
-[PathFinder](../PathFinder) is an attack-path analysis tool that consumes the
-output of common enumeration tools. one-shot-enum can turn its discovered
-services into the right follow-up commands for it, in two modes — pick one.
+## Output Example
 
-### `--suggest`
+```text
+[+] Targets queued: 1
+[*] Scan engine: nmap
+[*] Stage-1 threads: 10
+[*] Stage-1 timing: T4
+[*] Host fingerprint: best effort OS detection on top 20 ports before -Pn fallback
+[*] Stage-1 TCP port scope: full port range
+[*] Service enum timing: T3
+[*] AI enumeration mode: full rich probes + read-only MCP/A2A confirmation
 
-Prints the next-step enumeration commands for each discovered service (whatweb,
-ffuf, nikto, WordPress-only wpscan, enum4linux-ng, smbmap, netexec,
-snmp-check, showmount/NFS, redis-cli, rsync, smtp-user-enum, kerbrute,
-GetNPUsers, and more), with output flags that PathFinder's
-`scan` auto-detector understands, and writes a runnable `pathfinder_recon.sh`
-(plus `pathfinder_recon.ps1` for Windows post-foothold steps).
+[+] Starting TCP full-port discovery scans...
+[+] 10.10.10.10: open TCP ports -> 22,80,445,8000
 
-Default web enumeration is intentionally lean. Add `--power` to include the
-heavier `nuclei` check in the suggestions and live runs. `sqlmap` output is
-still supported by PathFinder as a parser input, but one-shot-enum does not fire
-generic sqlmap runs.
+[1/1] 10.10.10.10
+Host: 10.10.10.10
 
-```bash
-python one-shot-enum.py 10.10.10.10 --suggest
-```
+TCP Services
+  22/tcp    ssh             OpenSSH 8.9p1
+  80/tcp    http            Apache httpd 2.4.49
+  445/tcp   microsoft-ds    Samba smbd
+  8000/tcp  http            FastAPI
 
-In the generated script:
+AI attack pathfinder
+  http://10.10.10.10:8000
+    Surface: OpenAI-compatible API (high)
+    Agent role: Knowledge Base / RAG agent
+    Architecture: rag
+    Capabilities: tool-calling, database, file-processing
+    Next: review OpenAPI schema, model routes, upload paths, and tool manifests.
 
-- Live (uncommented) lines are unauthenticated recon you can run immediately.
-- If Nmap exposes an AD DNS domain from LDAP/RDP output, unauthenticated
-  Kerbrute/GetNPUsers commands use it automatically and remain live in `--run`.
-- Commands with unresolved placeholders are commented-out with
-  `<domain>`/`<user>`/`<pass>` markers to edit. Kerbrute/GetNPUsers stay
-  commented only when no domain could be inferred.
-- Commands that need credentials or a foothold (LDAP dumps, Kerberoasting,
-  certipy, secretsdump, linpeas/winpeas, SharpHound) are also commented-out.
-- Tools whose PathFinder parser is still on the roadmap are tagged
-  `parser pending`.
+[+] AI surfaces -> loot/10.10.10.10/llm_enum_8000.json
 
-Then run the script and hand the loot to PathFinder:
-
-```bash
-bash pathfinder_recon.sh
-python3 -m main.pathfinder scan loot/
-```
-
-Output is organised **one subdirectory per host** (`loot/<host>/…`), and each
-host's nmap XML is dropped in alongside its follow-up results. That means a
-multi-host engagement stays in a single loot tree, files from different hosts
-never collide, and PathFinder attributes every finding to the right host and
-correlates credentials across them:
-
-```
-loot/
-├── 10.10.10.10/
-│   ├── nmap.xml
-│   ├── ffuf_80.json
-│   └── nxc_10.10.10.10.log
-└── 10.10.10.20/
-    ├── nmap.xml
-    └── linpeas_10.10.10.20.txt
-```
-
-### `--run`
-
-Runs the whole pipeline for you: executes the unauthenticated recon commands
-into `loot/`, then invokes PathFinder on the results. **Skips any tool that
-isn't installed** and any command whose wordlist is missing; credentialed and
-post-foothold commands are never executed. Intended for the Kali/attack host
-(PathFinder is located in a sibling `../PathFinder` directory).
-
-```bash
-python one-shot-enum.py 10.10.10.10 --run
-python one-shot-enum.py 10.10.10.10 --run --power   # add nuclei
-python one-shot-enum.py 10.10.10.0/24 --run           # concurrency auto-scales to hosts
-python one-shot-enum.py 10.10.10.0/24 --run --top 10
-python one-shot-enum.py 10.10.10.0/24 --run --min-likelihood medium
-python one-shot-enum.py 10.10.10.0/24 --run --show-all
-python one-shot-enum.py 10.10.10.0/24 --run --ai-brief ai-brief.md
-python one-shot-enum.py 10.10.10.10 --run --run-timeout 300
-python one-shot-enum.py 10.10.10.10 --run --scan-timeout 900
-python one-shot-enum.py 10.10.10.10 --run --loot-dir loot-clientA   # isolate this engagement
-```
-
-Loot goes to `loot/` by default; `--loot-dir <dir>` chooses another. Because
-PathFinder analyses the **whole** loot tree, `--suggest`/`--run` warn if the loot
-dir already contains host directories that aren't in the current target set (stale
-data from a previous engagement) — use a fresh `--loot-dir` per engagement to keep
-runs from mixing.
-
-**Concurrency is one lane per host** — each host runs up to two tools at once and
-the lanes run in parallel, so a multi-host sweep goes fast while no single target
-is ever hammered (and a single box still gets two-way parallelism). There is
-nothing to tune; concurrency scales with the number of hosts automatically.
-
-Because tool output can't be sensibly interleaved, the terminal shows a live
-status table — one row per tool with its state, elapsed time, and latest
-progress line:
-
-```
-Recon [2 host lane(s), 2/host]: 3 running, 2 done, 1 skipped, 0 other
-  ffuf        10.10.10.10   running   00:42  | :: 38200/220560 :: 900 req/s
-  nikto       10.10.10.20   running   00:41  | + Server leaks inodes via ETags
+Recon [1 host lane(s), 2/host]: 2 running, 5 done, 0 skipped, 0 other
+> ffuf        10.10.10.10   running   00:42  | :: 38200/220560 :: 900 req/s
+> nikto       10.10.10.10   running   00:41  | + Server leaks inodes via ETags
   whatweb     10.10.10.10   done      00:03
-  smbmap      10.10.10.20   skip (no tool)   --:--
+  enum4linux  10.10.10.10   done      00:18
+
+[+] Recon complete: 7 ran clean, 0 skipped, 0 non-zero exit, 0 failed, 0 timed out, 0 interrupted
+[+] Per-tool logs: loot/_logs
+[*] Launching PathFinder on /home/kali/labs/loot (findings -> /home/kali/labs/findings.json)
 ```
 
-A tool that produces **no output for `--run-timeout` seconds (default 180)** is
-treated as hung and killed — so one stuck scanner never stalls the pipeline; it's
-marked `timed out` and the other lanes carry on. Set `--run-timeout 0` to
-disable. ffuf also gets `-maxtime 180` by default, because it can keep printing
-slow progress forever and therefore never trip an idle-output timeout.
-`--scan-timeout` sets the wall-clock ceiling for each Nmap invocation (default
-1800 seconds; `0` disables), which keeps slow filtered hosts from pinning
-the initial discovery/service-scan stage. Each tool's full output is captured to
-`loot/_logs/<tool>_<host>_<idx>.log` so
-nothing is lost and failures stay diagnosable.
+## Full Tooling on Kali
 
-## Requirements
+```bash
+sudo apt update
+sudo apt install -y \
+  nmap seclists ffuf nikto whatweb wpscan nuclei \
+  enum4linux-ng smbmap netexec impacket-scripts \
+  snmpcheck nfs-common redis-tools rsync smtp-user-enum kerbrute
+```
 
-- Python 3
-- `nmap` in `PATH` for normal remote scanning
+PathFinder should live beside this repo:
 
-Only localhost scans can run without `nmap`, using the built-in fallback mode.
+```text
+Github/
+  one-shot-enum/
+  PathFinder/
+```
+
+Install PathFinder dependencies from that checkout:
+
+```bash
+python3 -m pip install -r ../PathFinder/requirements.txt
+```
+
+## Notes
+
+- `--save` writes scan XML, host summaries, and `services_summary.csv` under
+  `scan_results/`.
+- `--udp` adds a top-ports UDP scan.
+- `--loot-dir <dir>` isolates engagements and avoids stale PathFinder input.
+- Only localhost scans can run without Nmap, using the built-in Python fallback.
+
+## Ethics
+
+Use one-shot-enum only on systems you own or have explicit written permission to
+test. You are responsible for how you use the output.
