@@ -53,6 +53,11 @@ python one-shot-enum.py 10.10.10.0/24 --pathfinder --min-likelihood medium
 python one-shot-enum.py 10.10.10.0/24 --pathfinder --offline
 ```
 
+For each discovered web service, the default recon plan also saves the landing
+page with `curl`. PathFinder extracts potential identities such as `ts_svc` as
+manual-triage `username_candidate` findings; it does not promote them to valid
+usernames automatically.
+
 PathFinder pass-through flags supported by one-shot-enum:
 
 - `--target-host`

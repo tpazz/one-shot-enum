@@ -2586,6 +2586,10 @@ def _web_suggestions(host: str, service: Service, loot: str, wordlist: str,
     k = " -k" if scheme == "https" else ""
     wl = shlex.quote(wordlist)
     out = [
+        _suggestion(host, group, "curl",
+                    f"curl{k} --location --silent --show-error --max-time 30 {base}/ "
+                    f"--output {_lootpath(loot, f'webpage_{scheme}_{port}.html')}",
+                    "webpage_html", output_file=_lootfile(loot, f"webpage_{scheme}_{port}.html")),
         _suggestion(host, group, "whatweb",
                     f"whatweb -a3 {base} --log-json={_lootpath(loot, f'whatweb_{port}.json')}", "whatweb_json",
                     output_file=_lootfile(loot, f"whatweb_{port}.json")),

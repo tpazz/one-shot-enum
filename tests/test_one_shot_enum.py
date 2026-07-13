@@ -143,6 +143,7 @@ class GeneratedCommandTests(unittest.TestCase):
 
     def test_default_web_commands_are_lean(self):
         cmds = self._commands()
+        self.assertIn("curl", cmds)
         self.assertIn("ffuf", cmds)
         self.assertIn("nikto", cmds)
         self.assertIn("whatweb", cmds)
@@ -430,6 +431,7 @@ class LootPathTests(unittest.TestCase):
         loot = "loot/o'ne host"
         suggestions = ose._web_suggestions("10.0.0.5", make_service(port=80), loot, "words.txt")
         expected = {
+            "curl": f"{loot}/webpage_http_80.html",
             "whatweb": f"{loot}/whatweb_80.json",
             "ffuf": f"{loot}/ffuf_80.json",
             "nikto": f"{loot}/nikto_80.json",
