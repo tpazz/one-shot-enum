@@ -2595,7 +2595,8 @@ def _web_suggestions(host: str, service: Service, loot: str, wordlist: str,
                     output_file=_lootfile(loot, f"whatweb_{port}.json")),
         _suggestion(host, group, "ffuf",
                     f"ffuf -u {base}/FUZZ -w {wl}{k} -maxtime {DEFAULT_FFUF_MAXTIME} "
-                    f"-of json -o {_lootpath(loot, f'ffuf_{port}.json')}",
+                    f"-of json -o {_lootpath(loot, f'ffuf_{port}.json')} "
+                    f"-od {_lootpath(loot, f'ffuf_pages_{scheme}_{port}')}",
                     "ffuf_json", output_file=_lootfile(loot, f"ffuf_{port}.json")),
         _suggestion(host, group, "nikto",
                     f"nikto -h {base} -Format json -o {_lootpath(loot, f'nikto_{port}.json')}", "nikto_json",

@@ -152,6 +152,7 @@ class GeneratedCommandTests(unittest.TestCase):
         self.assertNotIn("nuclei", cmds)
         self.assertNotIn("sqlmap", cmds)
         self.assertIn(f"-maxtime {ose.DEFAULT_FFUF_MAXTIME}", cmds["ffuf"])
+        self.assertIn("-od loot/10.0.0.5/ffuf_pages_http_80", cmds["ffuf"])
 
     def test_every_runnable_suggestion_declares_its_output_file(self):
         services = [
