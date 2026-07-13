@@ -3330,6 +3330,9 @@ def run_suggestions(all_suggestions: List[Dict[str, Any]],
 def run_pathfinder(pathfinder_path: str, loot: str,
                    top: int | None = None, min_likelihood: str | None = None,
                    show_all: bool = False,
+                   hide_discovery: bool = False,
+                   hide_findings: bool = False,
+                   validate_credentials: bool = False,
                    target_host: str | None = None,
                    output_json: str | None = None,
                    verbose: int = 0,
@@ -3377,6 +3380,12 @@ def run_pathfinder(pathfinder_path: str, loot: str,
         cmd.extend(["--min-likelihood", min_likelihood])
     if show_all:
         cmd.append("--show-all")
+    if hide_discovery:
+        cmd.append("--hide-discovery")
+    if hide_findings:
+        cmd.append("--hide-findings")
+    if validate_credentials:
+        cmd.append("--validate-credentials")
     try:
         subprocess.run(cmd, cwd=str(pf))
     except Exception as exc:
@@ -3500,6 +3509,21 @@ def parse_args() -> argparse.Namespace:
              "instead of grouped triage output",
     )
     parser.add_argument(
+        "--hide-discovery",
+        action="store_true",
+        help="With --pathfinder, hide discovery tool and command provenance from findings and attack paths",
+    )
+    parser.add_argument(
+        "--hide-findings",
+        action="store_true",
+        help="With --pathfinder, hide PathFinder's prioritized findings list",
+    )
+    parser.add_argument(
+        "--validate-credentials",
+        action="store_true",
+        help="With --pathfinder, actively test resolved credential-reuse login actions sequentially",
+    )
+    parser.add_argument(
         "--target-host",
         help="With --pathfinder, pass through to PathFinder scan. Usually unnecessary because "
              "one-shot-enum writes per-host loot directories.",
@@ -3577,6 +3601,12 @@ def parse_args() -> argparse.Namespace:
         used_pathfinder_only.append("--oscp")
     if args.show_all:
         used_pathfinder_only.append("--show-all")
+    if args.hide_discovery:
+        used_pathfinder_only.append("--hide-discovery")
+    if args.hide_findings:
+        used_pathfinder_only.append("--hide-findings")
+    if args.validate_credentials:
+        used_pathfinder_only.append("--validate-credentials")
     if args.top is not None:
         used_pathfinder_only.append("--top")
     if args.min_likelihood:
@@ -3896,6 +3926,9 @@ def main() -> None:
             top=args.top,
             min_likelihood=args.min_likelihood,
             show_all=args.show_all,
+            hide_discovery=args.hide_discovery,
+            hide_findings=args.hide_findings,
+            validate_credentials=args.validate_credentials,
             target_host=args.target_host,
             output_json=args.output_json,
             verbose=args.verbose,

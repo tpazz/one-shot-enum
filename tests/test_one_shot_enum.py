@@ -496,6 +496,9 @@ class PathFinderBridgeTests(unittest.TestCase):
                     top=10,
                     min_likelihood="medium",
                     show_all=True,
+                    hide_discovery=True,
+                    hide_findings=True,
+                    validate_credentials=True,
                     target_host="10.0.0.5",
                     output_json=str(out),
                     verbose=2,
@@ -533,6 +536,9 @@ class PathFinderBridgeTests(unittest.TestCase):
             self.assertIn("--min-likelihood", cmd)
             self.assertIn("medium", cmd)
             self.assertIn("--show-all", cmd)
+            self.assertIn("--hide-discovery", cmd)
+            self.assertIn("--hide-findings", cmd)
+            self.assertIn("--validate-credentials", cmd)
 
     @unittest.skipUnless(_HAS_PATHFINDER, "PathFinder sibling repo not present")
     def test_provenance_manifest_is_consumed_by_pathfinder_scan(self):
@@ -623,6 +629,9 @@ class PathFinderBridgeTests(unittest.TestCase):
                 ["--target-host", "10.0.0.5"],
                 ["--output-json", "findings.json"],
                 ["--top", "10"],
+                ["--hide-discovery"],
+                ["--hide-findings"],
+                ["--validate-credentials"],
             ):
                 sys.argv = ["one-shot-enum.py", "10.0.0.5", *extra]
                 with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
@@ -640,6 +649,8 @@ class PathFinderBridgeTests(unittest.TestCase):
                 "--github-cache", "cache.json", "--target-host", "10.0.0.5",
                 "--output-json", "findings.json", "-vv", "--oscp",
                 "--top", "10", "--min-likelihood", "medium", "--show-all",
+                "--hide-discovery", "--hide-findings",
+                "--validate-credentials",
             ]
             args = ose.parse_args()
         finally:
@@ -658,6 +669,9 @@ class PathFinderBridgeTests(unittest.TestCase):
         self.assertEqual(args.top, 10)
         self.assertEqual(args.min_likelihood, "medium")
         self.assertTrue(args.show_all)
+        self.assertTrue(args.hide_discovery)
+        self.assertTrue(args.hide_findings)
+        self.assertTrue(args.validate_credentials)
 
 
 class StaleLootTests(unittest.TestCase):

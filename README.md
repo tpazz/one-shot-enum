@@ -68,6 +68,9 @@ PathFinder pass-through flags supported by one-shot-enum:
 - `--top`
 - `--min-likelihood`
 - `--show-all`
+- `--hide-discovery`
+- `--hide-findings`
+- `--validate-credentials`
 
 `--target-host` is rarely needed because one-shot-enum writes a per-host loot
 layout that PathFinder can attribute automatically.
