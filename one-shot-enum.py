@@ -2338,6 +2338,7 @@ def write_csv_summary(csv_path: Path, rows: List[Dict[str, str]]) -> None:
 #                                       ->   pathfinder scan <loot>/
 
 LOOT_DIR = "loot"
+PATHFINDER_PROVENANCE_MANIFEST = "_pathfinder_provenance.json"
 DEFAULT_WEB_WORDLIST = "/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt"
 DEFAULT_USER_WORDLIST = "/usr/share/seclists/Usernames/top-usernames-shortlist.txt"
 PATHFINDER_SCAN_CMD = "python3 -m main.pathfinder scan"
@@ -2463,7 +2464,8 @@ def warn_stale_loot(loot: str, targets: List[str]) -> None:
              "--loot-dir <fresh> to avoid mixing engagements.")
 
 
-def write_llm_enum_loot(host: str, service: Service, loot: str) -> Optional[Path]:
+def write_llm_enum_loot(host: str, service: Service, loot: str,
+                        discovery_command: str = "") -> Optional[Path]:
     """Write a service's LLM/AI surface enumeration into the loot dir as a
     PathFinder-consumable JSON so PathFinder's AI/LLM rules can synthesise attack
     paths from it. Returns the written path, or None if there's nothing to emit."""
@@ -2479,6 +2481,7 @@ def write_llm_enum_loot(host: str, service: Service, loot: str) -> Optional[Path
     payload = {
         "tool": "one-shot-enum",
         "type": "llm_enum",
+        "discovery_command": discovery_command or None,
         "host": host,
         "port": port_int,
         "base_url": llm_enum.get("base_url"),
@@ -2524,11 +2527,11 @@ def write_llm_enum_loot(host: str, service: Service, loot: str) -> Optional[Path
 
 def _suggestion(host: str, group: str, tool: str, command: str, parser: str,
                 pending: bool = False, gated: bool = False, shell: str = "bash",
-                note: str = "") -> Dict[str, Any]:
+                note: str = "", output_file: str = "") -> Dict[str, Any]:
     return {
         "host": host, "group": group, "tool": tool, "command": command,
         "parser": parser, "pending": pending, "gated": gated, "shell": shell,
-        "note": note,
+        "note": note, "output_file": output_file,
     }
 
 
@@ -2569,6 +2572,11 @@ def _lootpath(loot: str, name: str) -> str:
     return shlex.quote(f"{loot}/{name}")
 
 
+def _lootfile(loot: str, name: str) -> str:
+    """Unquoted counterpart to _lootpath for structured provenance metadata."""
+    return f"{loot}/{name}"
+
+
 def _web_suggestions(host: str, service: Service, loot: str, wordlist: str,
                      power: bool = False) -> List[Dict[str, Any]]:
     scheme = _web_scheme(service)
@@ -2579,23 +2587,26 @@ def _web_suggestions(host: str, service: Service, loot: str, wordlist: str,
     wl = shlex.quote(wordlist)
     out = [
         _suggestion(host, group, "whatweb",
-                    f"whatweb -a3 {base} --log-json={_lootpath(loot, f'whatweb_{port}.json')}", "whatweb_json"),
+                    f"whatweb -a3 {base} --log-json={_lootpath(loot, f'whatweb_{port}.json')}", "whatweb_json",
+                    output_file=_lootfile(loot, f"whatweb_{port}.json")),
         _suggestion(host, group, "ffuf",
                     f"ffuf -u {base}/FUZZ -w {wl}{k} -maxtime {DEFAULT_FFUF_MAXTIME} "
                     f"-of json -o {_lootpath(loot, f'ffuf_{port}.json')}",
-                    "ffuf_json"),
+                    "ffuf_json", output_file=_lootfile(loot, f"ffuf_{port}.json")),
         _suggestion(host, group, "nikto",
-                    f"nikto -h {base} -Format json -o {_lootpath(loot, f'nikto_{port}.json')}", "nikto_json"),
+                    f"nikto -h {base} -Format json -o {_lootpath(loot, f'nikto_{port}.json')}", "nikto_json",
+                    output_file=_lootfile(loot, f"nikto_{port}.json")),
     ]
     if power:
         out.extend([
             _suggestion(host, group, "nuclei",
-                        f"nuclei -u {base} -jsonl -o {_lootpath(loot, f'nuclei_{port}.jsonl')}", "nuclei_jsonl"),
+                        f"nuclei -u {base} -jsonl -o {_lootpath(loot, f'nuclei_{port}.jsonl')}", "nuclei_jsonl",
+                        output_file=_lootfile(loot, f"nuclei_{port}.jsonl")),
         ])
     if _looks_wordpress(service):
         out.append(_suggestion(host, group, "wpscan",
                    f"wpscan --url {base} --format json -o {_lootpath(loot, f'wpscan_{port}.json')} --disable-tls-checks",
-                   "wpscan_json"))
+                   "wpscan_json", output_file=_lootfile(loot, f"wpscan_{port}.json")))
     return out
 
 
@@ -2603,14 +2614,16 @@ def _smb_suggestions(host: str, loot: str) -> List[Dict[str, Any]]:
     tag = safe_name(host)
     return [
         _suggestion(host, "smb", "enum4linux-ng",
-                    f"enum4linux-ng -A -oJ {_lootpath(loot, f'enum4linux_{tag}')} {host}", "enum4linux_json"),
+                    f"enum4linux-ng -A -oJ {_lootpath(loot, f'enum4linux_{tag}')} {host}", "enum4linux_json",
+                    output_file=_lootfile(loot, f"enum4linux_{tag}.json")),
         # tee (not >) so stdout still flows through the pipe the --run idle-timeout
         # watches; a plain redirect leaves the pipe silent and can get the tool killed.
         _suggestion(host, "smb", "smbmap",
-                    f"smbmap -H {host} -u guest -p '' | tee {_lootpath(loot, f'smbmap_{tag}.txt')}", "smbmap_txt"),
+                    f"smbmap -H {host} -u guest -p '' | tee {_lootpath(loot, f'smbmap_{tag}.txt')}", "smbmap_txt",
+                    output_file=_lootfile(loot, f"smbmap_{tag}.txt")),
         _suggestion(host, "smb", "netexec",
                     f"nxc smb {host} --shares --users --log {_lootpath(loot, f'nxc_{tag}.log')}",
-                    "netexec_log"),
+                    "netexec_log", output_file=_lootfile(loot, f"nxc_{tag}.log")),
     ]
 
 
@@ -2619,7 +2632,8 @@ def _snmp_suggestions(host: str, loot: str) -> List[Dict[str, Any]]:
         # tee (not >) so the --run idle-timeout sees output on the pipe; snmp-check
         # can walk a large MIB silently on stdout and would otherwise look hung.
         _suggestion(host, "snmp", "snmp-check",
-                    f"snmp-check {host} -c public | tee {_lootpath(loot, f'snmp_{safe_name(host)}.txt')}", "snmp_txt"),
+                    f"snmp-check {host} -c public | tee {_lootpath(loot, f'snmp_{safe_name(host)}.txt')}", "snmp_txt",
+                    output_file=_lootfile(loot, f"snmp_{safe_name(host)}.txt")),
     ]
 
 
@@ -2627,7 +2641,8 @@ def _nfs_suggestions(host: str, loot: str) -> List[Dict[str, Any]]:
     tag = safe_name(host)
     return [
         _suggestion(host, "nfs", "showmount",
-                    f"showmount -e {host} | tee {_lootpath(loot, f'nfs_{tag}.txt')}", "nfs_txt"),
+                    f"showmount -e {host} | tee {_lootpath(loot, f'nfs_{tag}.txt')}", "nfs_txt",
+                    output_file=_lootfile(loot, f"nfs_{tag}.txt")),
     ]
 
 
@@ -2636,7 +2651,7 @@ def _redis_suggestions(host: str, service: Service, loot: str) -> List[Dict[str,
     return [
         _suggestion(host, f"redis:{port}", "redis-cli",
                     f"redis-cli -h {host} -p {port} INFO | tee {_lootpath(loot, f'redis_{port}.txt')}",
-                    "redis_txt"),
+                    "redis_txt", output_file=_lootfile(loot, f"redis_{port}.txt")),
     ]
 
 
@@ -2645,7 +2660,7 @@ def _rsync_suggestions(host: str, loot: str) -> List[Dict[str, Any]]:
     return [
         _suggestion(host, "rsync", "rsync",
                     f"rsync --list-only rsync://{host}/ | tee {_lootpath(loot, f'rsync_{tag}.txt')}",
-                    "rsync_txt"),
+                    "rsync_txt", output_file=_lootfile(loot, f"rsync_{tag}.txt")),
     ]
 
 
@@ -2656,7 +2671,7 @@ def _smtp_suggestions(host: str, service: Service, loot: str, userlist: str) -> 
         _suggestion(host, f"smtp:{port}", "smtp-user-enum",
                     f"smtp-user-enum -M VRFY -U {ul} -t {host} -p {port} | tee "
                     f"{_lootpath(loot, f'smtp_user_enum_{port}.txt')}",
-                    "smtp_user_enum_txt"),
+                    "smtp_user_enum_txt", output_file=_lootfile(loot, f"smtp_user_enum_{port}.txt")),
     ]
 
 
@@ -2668,11 +2683,12 @@ def _ad_suggestions(host: str, loot: str, userlist: str, domain: str = "") -> Li
     return [
         _suggestion(host, "ad kerberos", "kerbrute",
                     f"kerbrute userenum -d {dom} --dc {host} {ul} -o {_lootpath(loot, 'kerbrute.txt')}",
-                    "kerbrute_txt", note=domain_note),
+                    "kerbrute_txt", note=domain_note,
+                    output_file=_lootfile(loot, "kerbrute.txt")),
         _suggestion(host, "ad kerberos", "impacket-GetNPUsers",
                     f"impacket-GetNPUsers {dom}/ -dc-ip {host} -usersfile {ul} "
                     f"-format hashcat -outputfile {_lootpath(loot, 'getnpusers.txt')}", "getnpusers_hashes",
-                    note=domain_note),
+                    note=domain_note, output_file=_lootfile(loot, "getnpusers.txt")),
         _suggestion(host, "ad (needs creds)", "ldapdomaindump",
                     f"ldapdomaindump -u '{dom}\\{user}' -p '{pw}' {host} -o {_lootpath(loot, 'ldap/')}",
                     "ldapdomaindump_dir", gated=True),
@@ -2900,6 +2916,60 @@ def runnable_suggestions(all_suggestions: List[Dict[str, Any]]) -> List[Dict[str
     ]
 
 
+def _output_fingerprint(path: Optional[str]) -> Optional[Tuple[int, int, int]]:
+    """Cheap identity used to prove a job created or changed its declared output."""
+    if not path:
+        return None
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return stat.st_size, stat.st_mtime_ns, getattr(stat, "st_ino", 0)
+
+
+def _write_pathfinder_provenance(loot: str, jobs: List[Dict[str, Any]]) -> Path:
+    """Persist exact producer commands so PathFinder can join them to loot files."""
+    loot_path = Path(loot)
+    loot_path.mkdir(parents=True, exist_ok=True)
+    manifest_path = loot_path / PATHFINDER_PROVENANCE_MANIFEST
+    existing: Dict[str, Dict[str, Any]] = {}
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        for record in payload.get("records", []) if isinstance(payload, dict) else []:
+            if isinstance(record, dict) and record.get("output_file"):
+                existing[str(record["output_file"]).replace("\\", "/").lower()] = record
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        pass
+
+    for job in jobs:
+        output_file = job.get("output_file")
+        if not output_file:
+            continue
+        output_after = _output_fingerprint(output_file)
+        if output_after is None or output_after == job.get("output_before"):
+            # A skipped/failed job must not claim an older file. Preserve any
+            # existing record until this job demonstrably creates/changes output.
+            continue
+        try:
+            relative = os.path.relpath(os.path.abspath(output_file), os.path.abspath(loot))
+        except (OSError, ValueError):
+            relative = output_file
+        relative = str(relative).replace("\\", "/")
+        record = {
+            "host": job.get("host"),
+            "tool": job.get("tool"),
+            "parser": job.get("parser"),
+            "output_file": relative,
+            "command": job.get("command"),
+            "status": job.get("state"),
+        }
+        existing[relative.lower()] = record
+
+    payload = {"schema_version": 1, "records": list(existing.values())}
+    write_text(manifest_path, json.dumps(payload, indent=2) + "\n")
+    return manifest_path
+
+
 def _print_run_plan(live: List[Dict[str, Any]]) -> None:
     print()
     print(bold("PathFinder Recon Plan", C.CYAN))
@@ -3120,10 +3190,12 @@ def run_suggestions(all_suggestions: List[Dict[str, Any]],
         binary = s["command"].split()[0]
         job: Dict[str, Any] = {
             "tool": s["tool"], "host": s["host"], "command": s["command"],
+            "parser": s.get("parser"), "output_file": s.get("output_file") or None,
             "state": "queued", "last": "", "rc": None, "start": None, "end": None,
             "error": "", "proc": None, "timed_out": False, "interrupted": False, "last_output": None,
             "logpath": str(logs_dir / f"{safe_name(s['tool'])}_{safe_name(s['host'])}_{idx}.log"),
         }
+        job["output_before"] = _output_fingerprint(job["output_file"])
         if shutil.which(binary) is None:
             job["state"] = "skip:no-tool"
         else:
@@ -3247,6 +3319,8 @@ def run_suggestions(all_suggestions: List[Dict[str, Any]],
     good(f"Recon complete: {ran} ran clean, {skipped} skipped, {nonzero} non-zero exit, "
          f"{failed} failed, {timed_out} timed out, {interrupted_count} interrupted")
     good(f"Per-tool logs: {logs_dir}")
+    provenance_path = _write_pathfinder_provenance(loot, jobs)
+    good(f"Discovery provenance: {provenance_path}")
     return {
         "ran": ran, "skipped": skipped, "nonzero": nonzero, "failed": failed,
         "timed_out": timed_out, "interrupted": interrupted_count if interrupted else 0,
@@ -3738,7 +3812,10 @@ def main() -> None:
             # terminal peek and does not write AI surface loot.
             if not args.llm_endpoint:
                 for svc in tcp_services:
-                    written_llm = write_llm_enum_loot(loot_host, svc, LOOT_DIR)
+                    written_llm = write_llm_enum_loot(
+                        loot_host, svc, LOOT_DIR,
+                        discovery_command=shlex.join([sys.executable, *sys.argv]),
+                    )
                     if written_llm:
                         good(f"AI surfaces -> {written_llm}")
             host_suggestions = suggest_for_host(

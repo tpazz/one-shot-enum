@@ -72,6 +72,13 @@ PathFinder pass-through flags supported by one-shot-enum:
 `--target-host` is rarely needed because one-shot-enum writes a per-host loot
 layout that PathFinder can attribute automatically.
 
+Live runs also write `loot/_pathfinder_provenance.json`. After recon completes,
+it records the exact tool, command, parser, output file, and completion state for
+each job that created or changed loot. Skipped/failed jobs that leave an older
+file untouched cannot overwrite its prior provenance. AI loot embeds the full
+one-shot-enum invocation directly. PathFinder preserves every command verbatim,
+including credentials supplied by the operator.
+
 ## Defaults
 
 - Loot directory: `loot/`
@@ -86,7 +93,8 @@ layout that PathFinder can attribute automatically.
 - SQLMap: never fired automatically; PathFinder can parse SQLMap logs you provide
 
 If a recon tool or wordlist is missing, `--pathfinder` skips that task and keeps
-going. Full per-tool logs are written under `loot/_logs/`.
+going. Full per-tool logs are written under `loot/_logs/`, and command provenance
+is written to `loot/_pathfinder_provenance.json`.
 
 ## Output Example
 
@@ -130,6 +138,7 @@ Recon [1 host lane(s), 2/host]: 2 running, 5 done, 0 skipped, 0 other
 
 [+] Recon complete: 7 ran clean, 0 skipped, 0 non-zero exit, 0 failed, 0 timed out, 0 interrupted
 [+] Per-tool logs: loot/_logs
+[+] Discovery provenance: loot/_pathfinder_provenance.json
 [*] Launching PathFinder on /home/kali/labs/loot (findings -> /home/kali/labs/findings.json)
 ```
 

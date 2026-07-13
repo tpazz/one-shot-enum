@@ -12,6 +12,7 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -150,6 +151,24 @@ class GeneratedCommandTests(unittest.TestCase):
         self.assertNotIn("nuclei", cmds)
         self.assertNotIn("sqlmap", cmds)
         self.assertIn(f"-maxtime {ose.DEFAULT_FFUF_MAXTIME}", cmds["ffuf"])
+
+    def test_every_runnable_suggestion_declares_its_output_file(self):
+        services = [
+            make_service(port=80, service="http"),
+            make_service(port=445, service="microsoft-ds"),
+            make_service(port=2049, service="nfs"),
+            make_service(port=6379, service="redis"),
+            make_service(port=873, service="rsync"),
+            make_service(port=25, service="smtp"),
+            make_service(port=389, service="ldap", extrainfo="Domain: corp.local"),
+        ]
+        suggestions = ose.suggest_for_host(
+            "10.0.0.5", services, [make_service(port=161, service="snmp", protocol="udp")],
+            "loot", "/wl.txt", "/users.txt", power=True,
+        )
+        runnable = ose.runnable_suggestions(suggestions)
+        self.assertTrue(runnable)
+        self.assertTrue(all(s["output_file"] for s in runnable))
 
     def test_wordpress_detection_adds_wpscan(self):
         wp = make_service(port=80, service="http", scripts="http-wordpress-users wp-content")
@@ -407,6 +426,54 @@ class LootPathTests(unittest.TestCase):
     def test_safe_name_preserves_ip(self):
         self.assertEqual(ose.safe_name("10.10.10.5"), "10.10.10.5")
 
+    def test_generated_suggestions_carry_unquoted_output_paths(self):
+        loot = "loot/o'ne host"
+        suggestions = ose._web_suggestions("10.0.0.5", make_service(port=80), loot, "words.txt")
+        expected = {
+            "whatweb": f"{loot}/whatweb_80.json",
+            "ffuf": f"{loot}/ffuf_80.json",
+            "nikto": f"{loot}/nikto_80.json",
+        }
+        self.assertEqual({s["tool"]: s["output_file"] for s in suggestions}, expected)
+        self.assertTrue(all(s["output_file"] not in s["command"] for s in suggestions))
+
+    def test_provenance_manifest_records_exact_command_and_relative_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            loot = Path(directory) / "loot"
+            output = loot / "10.0.0.5" / "kerbrute.txt"
+            output.parent.mkdir(parents=True)
+            output.write_text("alice\n", encoding="utf-8")
+            command = f"kerbrute userenum -d corp.local users.txt -o {output}"
+            manifest = ose._write_pathfinder_provenance(str(loot), [{
+                "host": "10.0.0.5", "tool": "kerbrute", "parser": "kerbrute_txt",
+                "output_file": str(output), "command": command, "state": "done",
+            }])
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+        self.assertEqual(payload["schema_version"], 1)
+        self.assertEqual(payload["records"][0]["output_file"], "10.0.0.5/kerbrute.txt")
+        self.assertEqual(payload["records"][0]["command"], command)
+        self.assertEqual(payload["records"][0]["status"], "done")
+
+    def test_unchanged_stale_output_keeps_previous_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            loot = Path(directory) / "loot"
+            output = loot / "10.0.0.5" / "ffuf.json"
+            output.parent.mkdir(parents=True)
+            output.write_text("old", encoding="utf-8")
+            old_job = {
+                "host": "10.0.0.5", "tool": "ffuf", "parser": "ffuf_json",
+                "output_file": str(output), "command": "ffuf old-command", "state": "done",
+                "output_before": None,
+            }
+            ose._write_pathfinder_provenance(str(loot), [old_job])
+            unchanged = ose._output_fingerprint(str(output))
+            skipped_job = dict(old_job, command="ffuf current-command", state="skip:no-tool",
+                               output_before=unchanged)
+            manifest = ose._write_pathfinder_provenance(str(loot), [skipped_job])
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+        self.assertEqual(payload["records"][0]["command"], "ffuf old-command")
+        self.assertEqual(payload["records"][0]["status"], "done")
+
 
 class PathFinderBridgeTests(unittest.TestCase):
     def test_run_pathfinder_passes_scan_flags(self):
@@ -466,6 +533,35 @@ class PathFinderBridgeTests(unittest.TestCase):
             self.assertIn("--min-likelihood", cmd)
             self.assertIn("medium", cmd)
             self.assertIn("--show-all", cmd)
+
+    @unittest.skipUnless(_HAS_PATHFINDER, "PathFinder sibling repo not present")
+    def test_provenance_manifest_is_consumed_by_pathfinder_scan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            loot = Path(directory) / "loot"
+            host_dir = loot / "10.0.0.5"
+            host_dir.mkdir(parents=True)
+            output = host_dir / "ffuf_80.json"
+            command = "ffuf -u http://10.0.0.5/FUZZ -w words.txt -of json -o loot/10.0.0.5/ffuf_80.json"
+            output.write_text(json.dumps({
+                "commandline": command,
+                "results": [{
+                    "input": {"FUZZ": "admin"}, "status": 200, "length": 10,
+                    "url": "http://10.0.0.5/admin", "host": "10.0.0.5:80",
+                }],
+            }), encoding="utf-8")
+            ose._write_pathfinder_provenance(str(loot), [{
+                "host": "10.0.0.5", "tool": "ffuf", "parser": "ffuf_json",
+                "output_file": str(output), "command": command, "state": "done",
+            }])
+            result = subprocess.run(
+                [sys.executable, "-m", "main.pathfinder", "scan", str(loot),
+                 "--offline", "--no-color"],
+                capture_output=True, text=True, cwd=PATHFINDER_DIR,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + "\n" + result.stderr)
+        self.assertIn("Discovery:", result.stdout)
+        self.assertIn("ffuf", result.stdout)
+        self.assertIn(command, result.stdout)
 
     def test_default_uses_full_active_ai_options(self):
         opts = ose._llm_enum_options(SimpleNamespace(pathfinder=False, llm_endpoint=False))
@@ -618,10 +714,15 @@ class LlmEnumLootSchemaTests(unittest.TestCase):
 
     def test_writes_expected_payload_shape(self):
         with tempfile.TemporaryDirectory() as d:
-            written = ose.write_llm_enum_loot("10.0.0.5", self._service_with_surface(), d)
+            invocation = "python one-shot-enum.py 10.0.0.5 --pathfinder --user token:secret"
+            written = ose.write_llm_enum_loot(
+                "10.0.0.5", self._service_with_surface(), d,
+                discovery_command=invocation,
+            )
             self.assertIsNotNone(written)
             payload = json.loads(Path(written).read_text(encoding="utf-8"))
             self.assertEqual(payload["tool"], "one-shot-enum")
+            self.assertEqual(payload["discovery_command"], invocation)
             self.assertEqual(payload["type"], "llm_enum")
             self.assertEqual(payload["host"], "10.0.0.5")
             self.assertEqual(payload["port"], 11434)
@@ -638,11 +739,17 @@ class LlmEnumLootSchemaTests(unittest.TestCase):
         from parsers.initial_foothold.llm_enum_parser import parse_llm_enum_json
         from main.finding_schema import validate_findings
         with tempfile.TemporaryDirectory() as d:
-            written = ose.write_llm_enum_loot("10.0.0.5", self._service_with_surface(), d)
+            invocation = "python one-shot-enum.py 10.0.0.5 --pathfinder --password hunter2"
+            written = ose.write_llm_enum_loot(
+                "10.0.0.5", self._service_with_surface(), d,
+                discovery_command=invocation,
+            )
             findings = parse_llm_enum_json(str(written))
             validate_findings(findings)  # raises if schema-incompatible
             self.assertTrue(findings)
             self.assertTrue(all(f["entity_type"] == "ai_service" for f in findings))
+            self.assertTrue(all(f["attributes"]["discovery_command"] == invocation
+                                for f in findings))
             self.assertIn("ollama", [f["name"] for f in findings])
 
 
