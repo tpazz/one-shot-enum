@@ -55,6 +55,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
@@ -146,6 +147,7 @@ LOCALHOST_TARGETS = {"localhost", "127.0.0.1", "::1"}
 LOCALHOST_CONNECT_TIMEOUT = 0.25
 LOCALHOST_READ_TIMEOUT = 0.4
 LOCALHOST_SCAN_WORKERS = 256
+MAX_EXPANDED_TARGETS = 65_536
 
 
 def nmap_installed() -> bool:
@@ -205,6 +207,10 @@ def expand_target(target: str) -> List[str]:
     if "/" in target:
         try:
             net = ipaddress.ip_network(target, strict=False)
+            if net.num_addresses > MAX_EXPANDED_TARGETS:
+                raise ValueError(
+                    f"network contains {net.num_addresses} addresses; maximum is {MAX_EXPANDED_TARGETS}"
+                )
             return [str(ip) for ip in net.hosts()]
         except ValueError as exc:
             raise ValueError(f"Invalid CIDR '{target}': {exc}") from exc
@@ -237,6 +243,12 @@ def expand_target(target: str) -> List[str]:
         if end_int < start_int:
             raise ValueError(f"Invalid range '{target}': end is before start")
 
+        range_size = end_int - start_int + 1
+        if range_size > MAX_EXPANDED_TARGETS:
+            raise ValueError(
+                f"Range '{target}' contains {range_size} addresses; maximum is {MAX_EXPANDED_TARGETS}"
+            )
+
         return [int_to_ip(i) for i in range(start_int, end_int + 1)]
 
     try:
@@ -251,6 +263,10 @@ def normalize_targets(raw_targets: List[str]) -> List[str]:
     for raw in raw_targets:
         for ip in expand_target(raw):
             expanded.add(ip)
+            if len(expanded) > MAX_EXPANDED_TARGETS:
+                raise ValueError(
+                    f"Target list expands beyond the maximum of {MAX_EXPANDED_TARGETS} unique addresses"
+                )
     return sorted(expanded, key=target_sort_key)
 
 
@@ -504,6 +520,7 @@ def run_nmap_with_progress(cmd: List[str], target: str, phase: str, proto: str =
         text=True,
         bufsize=1,
         universal_newlines=True,
+        errors="replace",
     )
 
     q: queue.Queue = queue.Queue()
@@ -720,6 +737,8 @@ HTTP_METHODS = {"get", "post", "put", "patch", "delete", "options", "head", "tra
 HTTP_TIMEOUT_SECONDS = 5
 PROBE_TIMEOUT_SECONDS = 2
 MAX_RESPONSE_CHARS = 6000
+MAX_HTTP_RESPONSE_BYTES = 1_048_576
+AI_TLS_MODES = ("auto", "verify", "insecure")
 MAX_PROBE_PREVIEW_CHARS = 300
 LLM_SERVICE_INDICATORS = (
     "fastapi",
@@ -1098,13 +1117,13 @@ def _extract_collection_names(engine: str, payload: Any) -> Optional[List[str]]:
     return None
 
 
-def enumerate_vector_store(base_url: str) -> Dict[str, Any]:
+def enumerate_vector_store(base_url: str, tls_mode: str = "verify") -> Dict[str, Any]:
     """Read-only: list collections/classes/indices from an exposed vector store.
 
     Returns {"engine","url","collections":[...],"collection_count","unauthenticated"}
     or {} if no known vector-store listing is reachable. GET-only; no writes."""
     for engine, path in VECTOR_STORE_LISTINGS:
-        response = http_request(f"{base_url}{path}")
+        response = http_request(f"{base_url}{path}", tls_mode=tls_mode)
         if not response.get("ok") or response.get("json") is None:
             continue
         names = _extract_collection_names(engine, response["json"])
@@ -1116,6 +1135,7 @@ def enumerate_vector_store(base_url: str) -> Dict[str, Any]:
             "collections": [n for n in names if n][:50],
             "collection_count": len(names),
             "unauthenticated": True,
+            "tls_unverified": bool(response.get("tls_unverified")),
         }
     return {}
 
@@ -1157,7 +1177,8 @@ def _parse_jsonrpc_body(response: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return obj if isinstance(obj, dict) else None
 
 
-def enumerate_mcp_tools(base_url: str, mcp_path: str = "/mcp") -> Dict[str, Any]:
+def enumerate_mcp_tools(base_url: str, mcp_path: str = "/mcp",
+                        tls_mode: str = "verify") -> Dict[str, Any]:
     """Read-only MCP capability confirmation via JSON-RPC initialize + tools/list.
 
     Returns {"path","url","tools":[{name,description,categories}],"tool_count"}
@@ -1168,7 +1189,7 @@ def enumerate_mcp_tools(base_url: str, mcp_path: str = "/mcp") -> Dict[str, Any]
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
         "params": {"protocolVersion": "2025-03-26", "capabilities": {},
                    "clientInfo": {"name": "one-shot-enum", "version": "1.0"}},
-    })
+    }, tls_mode=tls_mode)
     if initialize.get("status") is None or initialize.get("status") >= 500:
         return {}
     session = (initialize.get("headers") or {}).get("Mcp-Session-Id") \
@@ -1177,7 +1198,8 @@ def enumerate_mcp_tools(base_url: str, mcp_path: str = "/mcp") -> Dict[str, Any]
     if session:
         list_headers["Mcp-Session-Id"] = session
     listing = http_request(url, method="POST", extra_headers=list_headers, payload={
-        "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+        "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        tls_mode=tls_mode)
 
     body = _parse_jsonrpc_body(listing)
     tools: List[Dict[str, Any]] = []
@@ -1194,7 +1216,15 @@ def enumerate_mcp_tools(base_url: str, mcp_path: str = "/mcp") -> Dict[str, Any]
                     })
     if not tools:
         return {}
-    return {"path": mcp_path, "url": url, "tools": tools[:50], "tool_count": len(tools)}
+    return {
+        "path": mcp_path,
+        "url": url,
+        "tools": tools[:50],
+        "tool_count": len(tools),
+        "tls_unverified": bool(
+            initialize.get("tls_unverified") or listing.get("tls_unverified")
+        ),
+    }
 
 
 AGENT_CARD_PATHS = (
@@ -1207,14 +1237,18 @@ AGENT_CARD_PATHS = (
 )
 
 
-def fetch_agent_cards(base_url: str) -> List[Dict[str, Any]]:
+def fetch_agent_cards(base_url: str, tls_mode: str = "verify") -> List[Dict[str, Any]]:
     """Read-only: fetch A2A / agent-discovery documents that advertise capabilities,
     endpoints, and (crucially) whether a self-service registration route exists."""
     cards: List[Dict[str, Any]] = []
     for path in AGENT_CARD_PATHS:
-        response = http_request(f"{base_url}{path}")
+        response = http_request(f"{base_url}{path}", tls_mode=tls_mode)
         if response.get("ok") and response.get("json") is not None:
-            cards.append({"path": path, "card": response["json"]})
+            cards.append({
+                "path": path,
+                "card": response["json"],
+                "tls_unverified": bool(response.get("tls_unverified")),
+            })
     return cards
 
 
@@ -1332,11 +1366,95 @@ def truncate_text(value: str, limit: int = MAX_RESPONSE_CHARS) -> str:
     return value[:limit] + "\n... [truncated]"
 
 
+class _BlockedRedirectError(Exception):
+    pass
+
+
+def _url_origin(url: str) -> Tuple[str, str, int]:
+    parsed = urllib.parse.urlsplit(url)
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    port = parsed.port or (443 if scheme == "https" else 80)
+    return scheme, host, port
+
+
+class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow redirects only when scheme, host, and effective port stay unchanged."""
+
+    def __init__(self, original_url: str) -> None:
+        super().__init__()
+        self.original_origin = _url_origin(original_url)
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        try:
+            destination = _url_origin(newurl)
+        except ValueError as exc:
+            raise _BlockedRedirectError(f"blocked malformed redirect target: {exc}") from exc
+        if destination != self.original_origin:
+            raise _BlockedRedirectError(
+                f"blocked cross-origin redirect from {req.full_url} to {newurl}"
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _insecure_tls_context() -> ssl.SSLContext:
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
+
+
+def _is_tls_verification_error(exc: BaseException) -> bool:
+    """Return True when an exception chain represents certificate rejection."""
+    pending: List[BaseException] = [exc]
+    seen: Set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLCertVerificationError):
+            return True
+        if isinstance(current, urllib.error.URLError) and isinstance(current.reason, BaseException):
+            pending.append(current.reason)
+        for nested in (current.__cause__, current.__context__):
+            if isinstance(nested, BaseException):
+                pending.append(nested)
+    return False
+
+
+def _open_same_origin(request, timeout, verify_tls: bool = True):
+    handlers: List[Any] = [_SameOriginRedirectHandler(request.full_url)]
+    if request.full_url.lower().startswith("https://") and not verify_tls:
+        handlers.append(urllib.request.HTTPSHandler(context=_insecure_tls_context()))
+    opener = urllib.request.build_opener(*handlers)
+    return opener.open(request, timeout=timeout)
+
+
+def _read_bounded_http_body(response, cap: int = MAX_HTTP_RESPONSE_BYTES) -> bytes:
+    content_length = response.headers.get("Content-Length") if response.headers else None
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except (TypeError, ValueError):
+            declared_length = None
+        if declared_length is not None and declared_length > cap:
+            raise ValueError(f"HTTP response Content-Length exceeds {cap} bytes")
+    body = response.read(cap + 1)
+    if len(body) > cap:
+        raise ValueError(f"HTTP response body exceeds {cap} bytes")
+    return body
+
+
 def http_request(url: str,
                  method: str = "GET",
                  payload: Optional[Dict[str, Any]] = None,
                  timeout: int = HTTP_TIMEOUT_SECONDS,
-                 extra_headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+                 extra_headers: Optional[Dict[str, str]] = None,
+                 tls_mode: str = "verify") -> Dict[str, Any]:
+    if tls_mode not in AI_TLS_MODES:
+        raise ValueError(f"Unsupported AI TLS mode: {tls_mode}")
+
     data = None
     headers = {
         "Accept": "application/json, text/plain;q=0.9, */*;q=0.8",
@@ -1351,29 +1469,47 @@ def http_request(url: str,
 
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
 
-    response_headers: Dict[str, str] = {}
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            body_bytes = response.read()
-            status = response.getcode()
-            content_type = response.headers.get("Content-Type", "")
-            response_headers = {k: v for k, v in response.headers.items()}
-    except urllib.error.HTTPError as exc:
-        body_bytes = exc.read()
-        status = exc.code
-        content_type = exc.headers.get("Content-Type", "") if exc.headers else ""
-        if exc.headers:
-            response_headers = {k: v for k, v in exc.headers.items()}
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        return {
-            "ok": False,
-            "status": None,
-            "content_type": "",
-            "text": "",
-            "json": None,
-            "headers": {},
-            "error": str(exc),
-        }
+    verify_tls = tls_mode != "insecure"
+    tls_unverified = url.lower().startswith("https://") and not verify_tls
+    while True:
+        response_headers: Dict[str, str] = {}
+        try:
+            with _open_same_origin(request, timeout=timeout, verify_tls=verify_tls) as response:
+                body_bytes = _read_bounded_http_body(response)
+                status = response.getcode()
+                content_type = response.headers.get("Content-Type", "")
+                response_headers = {k: v for k, v in response.headers.items()}
+            break
+        except urllib.error.HTTPError as exc:
+            try:
+                body_bytes = _read_bounded_http_body(exc)
+            except ValueError as body_exc:
+                return {
+                    "ok": False, "status": exc.code, "content_type": "", "text": "",
+                    "json": None, "headers": {}, "error": str(body_exc),
+                    "tls_mode": tls_mode, "tls_unverified": tls_unverified,
+                }
+            status = exc.code
+            content_type = exc.headers.get("Content-Type", "") if exc.headers else ""
+            if exc.headers:
+                response_headers = {k: v for k, v in exc.headers.items()}
+            break
+        except (_BlockedRedirectError, urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            if tls_mode == "auto" and verify_tls and _is_tls_verification_error(exc):
+                verify_tls = False
+                tls_unverified = True
+                continue
+            return {
+                "ok": False,
+                "status": None,
+                "content_type": "",
+                "text": "",
+                "json": None,
+                "headers": {},
+                "error": str(exc),
+                "tls_mode": tls_mode,
+                "tls_unverified": tls_unverified,
+            }
 
     text = body_bytes.decode("utf-8", errors="replace")
     parsed_json = None
@@ -1390,6 +1526,8 @@ def http_request(url: str,
         "json": parsed_json,
         "headers": response_headers,
         "error": "",
+        "tls_mode": tls_mode,
+        "tls_unverified": tls_unverified,
     }
 
 
@@ -1429,7 +1567,7 @@ def is_interesting_probe_response(response: Dict[str, Any]) -> bool:
     return 200 <= status < 400 or status in (400, 401, 403, 405, 422)
 
 
-def probe_llm_paths(base_url: str) -> List[Dict[str, Any]]:
+def probe_llm_paths(base_url: str, tls_mode: str = "verify") -> List[Dict[str, Any]]:
     hits: List[Dict[str, Any]] = []
 
     with ThreadPoolExecutor(max_workers=8) as executor:
@@ -1438,6 +1576,7 @@ def probe_llm_paths(base_url: str) -> List[Dict[str, Any]]:
                 http_request,
                 f"{base_url}{path}",
                 timeout=PROBE_TIMEOUT_SECONDS,
+                tls_mode=tls_mode,
             ): (index, path)
             for index, path in enumerate(LLM_PROBE_PATHS)
         }
@@ -1466,6 +1605,7 @@ def probe_llm_paths(base_url: str) -> List[Dict[str, Any]]:
                 "content_type": response.get("content_type", ""),
                 "preview": probe_response_preview(response),
                 "json_preview_lines": format_probe_json_preview(response),
+                "tls_unverified": bool(response.get("tls_unverified")),
             })
 
     return sorted(hits, key=lambda hit: hit["index"])
@@ -1755,10 +1895,11 @@ def enumerate_llm_service(target: str,
                           service: Service,
                           endpoint_only: bool = False,
                           ai_paths_mode: bool = False,
-                          active: bool = False) -> Dict[str, Any]:
+                          active: bool = False,
+                          tls_mode: str = "auto") -> Dict[str, Any]:
     base_url = service_base_url(target, service)
     openapi_url = f"{base_url}{OPENAPI_CANDIDATE_PATHS[0]}"
-    openapi_response = http_request(openapi_url)
+    openapi_response = http_request(openapi_url, tls_mode=tls_mode)
 
     result: Dict[str, Any] = {
         "base_url": base_url,
@@ -1776,13 +1917,23 @@ def enumerate_llm_service(target: str,
         "mcp_tools": {},
         "agent_cards": [],
         "chat_path": "",
+        "tls_mode": tls_mode,
+        "tls_unverified": bool(openapi_response.get("tls_unverified")),
     }
 
     apply_openapi_response(result, openapi_response, openapi_url)
+    effective_tls_mode = (
+        "insecure"
+        if tls_mode == "auto" and openapi_response.get("tls_unverified")
+        else tls_mode
+    )
     if not result["endpoints"]:
         for openapi_path in OPENAPI_CANDIDATE_PATHS[1:]:
             candidate_url = f"{base_url}{openapi_path}"
-            candidate_response = http_request(candidate_url)
+            candidate_response = http_request(candidate_url, tls_mode=effective_tls_mode)
+            result["tls_unverified"] = bool(
+                result["tls_unverified"] or candidate_response.get("tls_unverified")
+            )
             candidate_endpoints = parse_openapi_endpoints(candidate_response.get("json"))
             if candidate_endpoints:
                 apply_openapi_response(result, candidate_response, candidate_url)
@@ -1793,7 +1944,11 @@ def enumerate_llm_service(target: str,
         result["agent_profile"] = infer_agent_profile(result)
         return result
 
-    result["probe_hits"] = probe_llm_paths(base_url)
+    result["probe_hits"] = probe_llm_paths(base_url, tls_mode=effective_tls_mode)
+    result["tls_unverified"] = bool(
+        result["tls_unverified"]
+        or any(hit.get("tls_unverified") for hit in result["probe_hits"])
+    )
     result["ai_surfaces"] = infer_ai_surfaces(service, result)
     result["agent_profile"] = infer_agent_profile(result)
 
@@ -1802,7 +1957,10 @@ def enumerate_llm_service(target: str,
     surface_keys = {s.get("key") for s in result["ai_surfaces"] if isinstance(s, dict)}
     architecture = result["agent_profile"].get("architecture")
     if architecture == "vector-store" or "rag-vector" in surface_keys:
-        result["vector_store"] = enumerate_vector_store(base_url)
+        result["vector_store"] = enumerate_vector_store(base_url, tls_mode=effective_tls_mode)
+        result["tls_unverified"] = bool(
+            result["tls_unverified"] or result["vector_store"].get("tls_unverified")
+        )
 
     # Active confirmation: turn inferred MCP/A2A capability into a real tool
     # inventory / agent-card list. Still read-only (initialize + tools/list, GET
@@ -1811,10 +1969,17 @@ def enumerate_llm_service(target: str,
         probe_paths = {str(hit.get("path", "")).lower() for hit in result["probe_hits"]}
         if architecture == "tool-server" or "agent-mcp" in surface_keys \
                 or any(p in probe_paths for p in ("/mcp", "/mcp/", "/sse")):
-            result["mcp_tools"] = enumerate_mcp_tools(base_url)
+            result["mcp_tools"] = enumerate_mcp_tools(base_url, tls_mode=effective_tls_mode)
+            result["tls_unverified"] = bool(
+                result["tls_unverified"] or result["mcp_tools"].get("tls_unverified")
+            )
         if architecture == "multi-agent" \
                 or any(p in probe_paths for p in ("/.well-known/agent.json", "/agents", "/a2a")):
-            result["agent_cards"] = fetch_agent_cards(base_url)
+            result["agent_cards"] = fetch_agent_cards(base_url, tls_mode=effective_tls_mode)
+            result["tls_unverified"] = bool(
+                result["tls_unverified"]
+                or any(card.get("tls_unverified") for card in result["agent_cards"])
+            )
 
     # Record whether a chat/completions endpoint exists, across common stacks
     # (/chat, Ollama /api/chat, OpenAI /v1/chat/completions, ...). Enumeration
@@ -1838,7 +2003,8 @@ def run_llm_enumeration(target: str,
                         endpoint_only: bool = False,
                         probe_all_http: bool = False,
                         ai_paths_mode: bool = False,
-                        active: bool = False) -> None:
+                        active: bool = False,
+                        tls_mode: str = "auto") -> None:
     for service in tcp_services:
         if not resembles_llm_service(service) and not (probe_all_http and is_http_like_service(service)):
             continue
@@ -1852,6 +2018,7 @@ def run_llm_enumeration(target: str,
             endpoint_only=endpoint_only,
             ai_paths_mode=ai_paths_mode,
             active=active,
+            tls_mode=tls_mode,
         )
 
 
@@ -1860,6 +2027,17 @@ def llm_enum_lines(llm_enum: Dict[str, Any]) -> List[str]:
     lines: List[str] = [bold("LLM/API endpoint enum:" if endpoint_only else "LLM/API enum:", C.CYAN)]
     status = llm_enum.get("openapi_status")
     status_text = f"status {status}" if status is not None else "no status"
+
+    if llm_enum.get("tls_unverified"):
+        tls_notice = (
+            "  TLS: AI probes ran with certificate verification disabled"
+            if llm_enum.get("tls_mode") == "insecure"
+            else "  TLS: certificate verification failed; AI probes retried without verification"
+        )
+        lines.append(color(
+            tls_notice,
+            C.YELLOW,
+        ))
 
     if llm_enum.get("openapi_error"):
         lines.append(f"  OpenAPI: {status_text}; {llm_enum['openapi_error']}")
@@ -2572,6 +2750,16 @@ def _lootpath(loot: str, name: str) -> str:
     return shlex.quote(f"{loot}/{name}")
 
 
+def _bash_arg(value: Any) -> str:
+    """Quote every dynamic field inserted into a generated POSIX shell command."""
+    return shlex.quote(str(value))
+
+
+def _powershell_arg(value: Any) -> str:
+    """Single-quote a literal for generated PowerShell commands."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
 def _lootfile(loot: str, name: str) -> str:
     """Unquoted counterpart to _lootpath for structured provenance metadata."""
     return f"{loot}/{name}"
@@ -2584,50 +2772,51 @@ def _web_suggestions(host: str, service: Service, loot: str, wordlist: str,
     base = f"{scheme}://{host}:{port}"
     group = f"web {scheme}:{port}"
     k = " -k" if scheme == "https" else ""
-    wl = shlex.quote(wordlist)
+    wl = _bash_arg(wordlist)
     out = [
         _suggestion(host, group, "curl",
-                    f"curl{k} --location --silent --show-error --max-time 30 {base}/ "
+                    f"curl{k} --location --silent --show-error --max-time 30 {_bash_arg(base + '/')} "
                     f"--output {_lootpath(loot, f'webpage_{scheme}_{port}.html')}",
                     "webpage_html", output_file=_lootfile(loot, f"webpage_{scheme}_{port}.html")),
         _suggestion(host, group, "whatweb",
-                    f"whatweb -a3 {base} --log-json={_lootpath(loot, f'whatweb_{port}.json')}", "whatweb_json",
+                    f"whatweb -a3 {_bash_arg(base)} --log-json={_lootpath(loot, f'whatweb_{port}.json')}", "whatweb_json",
                     output_file=_lootfile(loot, f"whatweb_{port}.json")),
         _suggestion(host, group, "ffuf",
-                    f"ffuf -u {base}/FUZZ -w {wl}{k} -maxtime {DEFAULT_FFUF_MAXTIME} "
+                    f"ffuf -u {_bash_arg(base + '/FUZZ')} -w {wl}{k} -maxtime {_bash_arg(DEFAULT_FFUF_MAXTIME)} "
                     f"-of json -o {_lootpath(loot, f'ffuf_{port}.json')} "
                     f"-od {_lootpath(loot, f'ffuf_pages_{scheme}_{port}')}",
                     "ffuf_json", output_file=_lootfile(loot, f"ffuf_{port}.json")),
         _suggestion(host, group, "nikto",
-                    f"nikto -h {base} -Format json -o {_lootpath(loot, f'nikto_{port}.json')}", "nikto_json",
+                    f"nikto -h {_bash_arg(base)} -Format json -o {_lootpath(loot, f'nikto_{port}.json')}", "nikto_json",
                     output_file=_lootfile(loot, f"nikto_{port}.json")),
     ]
     if power:
         out.extend([
             _suggestion(host, group, "nuclei",
-                        f"nuclei -u {base} -jsonl -o {_lootpath(loot, f'nuclei_{port}.jsonl')}", "nuclei_jsonl",
+                        f"nuclei -u {_bash_arg(base)} -jsonl -o {_lootpath(loot, f'nuclei_{port}.jsonl')}", "nuclei_jsonl",
                         output_file=_lootfile(loot, f"nuclei_{port}.jsonl")),
         ])
     if _looks_wordpress(service):
         out.append(_suggestion(host, group, "wpscan",
-                   f"wpscan --url {base} --format json -o {_lootpath(loot, f'wpscan_{port}.json')} --disable-tls-checks",
+                   f"wpscan --url {_bash_arg(base)} --format json -o {_lootpath(loot, f'wpscan_{port}.json')} --disable-tls-checks",
                    "wpscan_json", output_file=_lootfile(loot, f"wpscan_{port}.json")))
     return out
 
 
 def _smb_suggestions(host: str, loot: str) -> List[Dict[str, Any]]:
     tag = safe_name(host)
+    q_host = _bash_arg(host)
     return [
         _suggestion(host, "smb", "enum4linux-ng",
-                    f"enum4linux-ng -A -oJ {_lootpath(loot, f'enum4linux_{tag}')} {host}", "enum4linux_json",
+                    f"enum4linux-ng -A -oJ {_lootpath(loot, f'enum4linux_{tag}')} {q_host}", "enum4linux_json",
                     output_file=_lootfile(loot, f"enum4linux_{tag}.json")),
         # tee (not >) so stdout still flows through the pipe the --run idle-timeout
         # watches; a plain redirect leaves the pipe silent and can get the tool killed.
         _suggestion(host, "smb", "smbmap",
-                    f"smbmap -H {host} -u guest -p '' | tee {_lootpath(loot, f'smbmap_{tag}.txt')}", "smbmap_txt",
+                    f"smbmap -H {q_host} -u guest -p '' | tee {_lootpath(loot, f'smbmap_{tag}.txt')}", "smbmap_txt",
                     output_file=_lootfile(loot, f"smbmap_{tag}.txt")),
         _suggestion(host, "smb", "netexec",
-                    f"nxc smb {host} --shares --users --log {_lootpath(loot, f'nxc_{tag}.log')}",
+                    f"nxc smb {q_host} --shares --users --log {_lootpath(loot, f'nxc_{tag}.log')}",
                     "netexec_log", output_file=_lootfile(loot, f"nxc_{tag}.log")),
     ]
 
@@ -2637,7 +2826,7 @@ def _snmp_suggestions(host: str, loot: str) -> List[Dict[str, Any]]:
         # tee (not >) so the --run idle-timeout sees output on the pipe; snmp-check
         # can walk a large MIB silently on stdout and would otherwise look hung.
         _suggestion(host, "snmp", "snmp-check",
-                    f"snmp-check {host} -c public | tee {_lootpath(loot, f'snmp_{safe_name(host)}.txt')}", "snmp_txt",
+                    f"snmp-check {_bash_arg(host)} -c public | tee {_lootpath(loot, f'snmp_{safe_name(host)}.txt')}", "snmp_txt",
                     output_file=_lootfile(loot, f"snmp_{safe_name(host)}.txt")),
     ]
 
@@ -2646,7 +2835,7 @@ def _nfs_suggestions(host: str, loot: str) -> List[Dict[str, Any]]:
     tag = safe_name(host)
     return [
         _suggestion(host, "nfs", "showmount",
-                    f"showmount -e {host} | tee {_lootpath(loot, f'nfs_{tag}.txt')}", "nfs_txt",
+                    f"showmount -e {_bash_arg(host)} | tee {_lootpath(loot, f'nfs_{tag}.txt')}", "nfs_txt",
                     output_file=_lootfile(loot, f"nfs_{tag}.txt")),
     ]
 
@@ -2655,7 +2844,7 @@ def _redis_suggestions(host: str, service: Service, loot: str) -> List[Dict[str,
     port = _svc_port(service) or 6379
     return [
         _suggestion(host, f"redis:{port}", "redis-cli",
-                    f"redis-cli -h {host} -p {port} INFO | tee {_lootpath(loot, f'redis_{port}.txt')}",
+                    f"redis-cli -h {_bash_arg(host)} -p {_bash_arg(port)} INFO | tee {_lootpath(loot, f'redis_{port}.txt')}",
                     "redis_txt", output_file=_lootfile(loot, f"redis_{port}.txt")),
     ]
 
@@ -2664,17 +2853,17 @@ def _rsync_suggestions(host: str, loot: str) -> List[Dict[str, Any]]:
     tag = safe_name(host)
     return [
         _suggestion(host, "rsync", "rsync",
-                    f"rsync --list-only rsync://{host}/ | tee {_lootpath(loot, f'rsync_{tag}.txt')}",
+                    f"rsync --list-only {_bash_arg(f'rsync://{host}/')} | tee {_lootpath(loot, f'rsync_{tag}.txt')}",
                     "rsync_txt", output_file=_lootfile(loot, f"rsync_{tag}.txt")),
     ]
 
 
 def _smtp_suggestions(host: str, service: Service, loot: str, userlist: str) -> List[Dict[str, Any]]:
     port = _svc_port(service) or 25
-    ul = shlex.quote(userlist)
+    ul = _bash_arg(userlist)
     return [
         _suggestion(host, f"smtp:{port}", "smtp-user-enum",
-                    f"smtp-user-enum -M VRFY -U {ul} -t {host} -p {port} | tee "
+                    f"smtp-user-enum -M VRFY -U {ul} -t {_bash_arg(host)} -p {_bash_arg(port)} | tee "
                     f"{_lootpath(loot, f'smtp_user_enum_{port}.txt')}",
                     "smtp_user_enum_txt", output_file=_lootfile(loot, f"smtp_user_enum_{port}.txt")),
     ]
@@ -2684,43 +2873,47 @@ def _ad_suggestions(host: str, loot: str, userlist: str, domain: str = "") -> Li
     dom = domain or DOMAIN_PLACEHOLDER
     user, pw = USER_PLACEHOLDER, PASS_PLACEHOLDER
     domain_note = f"domain inferred from nmap: {domain}" if domain else ""
-    ul = shlex.quote(userlist)
+    ul = _bash_arg(userlist)
+    q_host = _bash_arg(host)
+    q_dom = _bash_arg(dom)
     return [
         _suggestion(host, "ad kerberos", "kerbrute",
-                    f"kerbrute userenum -d {dom} --dc {host} {ul} -o {_lootpath(loot, 'kerbrute.txt')}",
+                    f"kerbrute userenum -d {q_dom} --dc {q_host} {ul} -o {_lootpath(loot, 'kerbrute.txt')}",
                     "kerbrute_txt", note=domain_note,
                     output_file=_lootfile(loot, "kerbrute.txt")),
         _suggestion(host, "ad kerberos", "impacket-GetNPUsers",
-                    f"impacket-GetNPUsers {dom}/ -dc-ip {host} -usersfile {ul} "
+                    f"impacket-GetNPUsers {_bash_arg(dom + '/')} -dc-ip {q_host} -usersfile {ul} "
                     f"-format hashcat -outputfile {_lootpath(loot, 'getnpusers.txt')}", "getnpusers_hashes",
                     note=domain_note, output_file=_lootfile(loot, "getnpusers.txt")),
         _suggestion(host, "ad (needs creds)", "ldapdomaindump",
-                    f"ldapdomaindump -u '{dom}\\{user}' -p '{pw}' {host} -o {_lootpath(loot, 'ldap/')}",
+                    f"ldapdomaindump -u {_bash_arg(dom + chr(92) + user)} -p {_bash_arg(pw)} {q_host} -o {_lootpath(loot, 'ldap/')}",
                     "ldapdomaindump_dir", gated=True),
         _suggestion(host, "ad (needs creds)", "impacket-GetUserSPNs",
-                    f"impacket-GetUserSPNs {dom}/{user}:{pw} -dc-ip {host} -request "
+                    f"impacket-GetUserSPNs {_bash_arg(f'{dom}/{user}:{pw}')} -dc-ip {q_host} -request "
                     f"-outputfile {_lootpath(loot, 'getuserspns.txt')}", "getuserspns_hashes", gated=True),
         _suggestion(host, "ad (needs creds)", "certipy",
-                    f"certipy find -u {user}@{dom} -p '{pw}' -dc-ip {host} -json -output {_lootpath(loot, 'certipy')}",
+                    f"certipy find -u {_bash_arg(user + '@' + dom)} -p {_bash_arg(pw)} -dc-ip {q_host} -json -output {_lootpath(loot, 'certipy')}",
                     "certipy_json", gated=True),
         _suggestion(host, "ad (needs creds)", "impacket-secretsdump",
-                    f"impacket-secretsdump {dom}/{user}:{pw}@{host} | tee {_lootpath(loot, 'secretsdump.txt')}",
+                    f"impacket-secretsdump {_bash_arg(f'{dom}/{user}:{pw}@{host}')} | tee {_lootpath(loot, 'secretsdump.txt')}",
                     "secretsdump_txt", gated=True),
     ]
 
 
 def _post_foothold_suggestions(host: str, loot: str) -> List[Dict[str, Any]]:
     tag = safe_name(host)
+    winpeas_path = _powershell_arg(f"{loot}\\winpeas_{tag}.txt")
+    sharphound_path = _powershell_arg(f"{loot}\\sharphound_{tag}")
     return [
         _suggestion(host, "post-foothold (linux)", "linpeas",
                     f"./linpeas.sh | tee {_lootpath(loot, f'linpeas_{tag}.txt')}", "linpeas_txt", gated=True),
         _suggestion(host, "post-foothold (windows)", "winpeas",
-                    f".\\winPEASany.exe > {loot}\\winpeas_{tag}.txt", "winpeas_txt",
+                    f".\\winPEASany.exe > {winpeas_path}", "winpeas_txt",
                     gated=True, shell="powershell"),
         _suggestion(host, "post-foothold (windows)", "SharpHound",
-                    f".\\SharpHound.exe -c All --outputdirectory {loot}\\sharphound_{tag}",
+                    f".\\SharpHound.exe -c All --outputdirectory {sharphound_path}",
                     "sharphound_dir", gated=True, shell="powershell",
-                    note="unzip the resulting .zip into that folder before scanning"),
+                    note="PathFinder consumes the resulting timestamped JSON or .zip directly"),
     ]
 
 
@@ -3340,6 +3533,9 @@ def run_pathfinder(pathfinder_path: str, loot: str,
                    validate_credentials: bool = False,
                    target_host: str | None = None,
                    output_json: str | None = None,
+                   report: str | None = None,
+                   report_redact_secrets: bool = False,
+                   report_include_secrets: bool = False,
                    verbose: int = 0,
                    max_vulns: int | None = None,
                    offline: bool = False,
@@ -3361,6 +3557,12 @@ def run_pathfinder(pathfinder_path: str, loot: str,
     findings_path = os.path.abspath(output_json) if output_json else os.path.join(os.path.dirname(loot_abs), "findings.json")
     info(f"Launching PathFinder on {loot_abs} (findings -> {findings_path})")
     cmd = [sys.executable, "-m", "main.pathfinder", "scan", loot_abs, "-o", findings_path]
+    if report:
+        cmd.extend(["--report", os.path.abspath(report)])
+    if report_redact_secrets:
+        cmd.append("--report-redact-secrets")
+    if report_include_secrets:
+        cmd.append("--report-include-secrets")
     if target_host:
         cmd.extend(["--target-host", target_host])
     if verbose:
@@ -3435,6 +3637,14 @@ def parse_args() -> argparse.Namespace:
         "--llm-endpoint",
         action="store_true",
         help="Quick, read-only peek: list discovered OpenAPI endpoints on LLM/API-like services",
+    )
+    parser.add_argument(
+        "--ai-tls",
+        choices=AI_TLS_MODES,
+        default="auto",
+        help="TLS policy for remote AI probes: verify first then retry certificate failures "
+             "unverified (auto), require valid certificates (verify), or always skip verification "
+             "(insecure); default: auto",
     )
     parser.add_argument(
         "--timing",
@@ -3539,6 +3749,17 @@ def parse_args() -> argparse.Namespace:
              "(default: findings.json next to the loot dir)",
     )
     parser.add_argument(
+        "--report", nargs="?", const="pathfinder-report.html", metavar="HTML",
+        help="With --pathfinder, write a self-contained HTML engagement report "
+             "(default path: pathfinder-report.html)",
+    )
+    parser.add_argument(
+        "--report-redact-secrets",
+        action="store_true",
+        help="With --pathfinder --report, redact credential secrets in a sanitized HTML report",
+    )
+    parser.add_argument("--report-include-secrets", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
         "-v", "--verbose",
         action="count",
         default=0,
@@ -3585,11 +3806,21 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max-vulns must be >= 0.")
     if args.pathfinder_suggest and args.pathfinder:
         parser.error("Use either --pathfinder-suggest or --pathfinder, not both.")
+    if (args.report_redact_secrets or args.report_include_secrets) and not args.report:
+        parser.error("report secret-policy flags require --report.")
+    if args.report_redact_secrets and args.report_include_secrets:
+        parser.error("--report-redact-secrets cannot be combined with --report-include-secrets.")
     used_pathfinder_only = []
     if args.target_host:
         used_pathfinder_only.append("--target-host")
     if args.output_json:
         used_pathfinder_only.append("--output-json")
+    if args.report:
+        used_pathfinder_only.append("--report")
+    if args.report_redact_secrets:
+        used_pathfinder_only.append("--report-redact-secrets")
+    if args.report_include_secrets:
+        used_pathfinder_only.append("--report-include-secrets")
     if args.verbose:
         used_pathfinder_only.append("-v/--verbose")
     if args.max_vulns is not None:
@@ -3625,19 +3856,22 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def _llm_enum_options(args: argparse.Namespace, use_local_fallback: bool = False) -> Optional[Dict[str, bool]]:
+def _llm_enum_options(args: argparse.Namespace, use_local_fallback: bool = False) -> Optional[Dict[str, Any]]:
+    tls_mode = getattr(args, "ai_tls", "auto")
     if getattr(args, "llm_endpoint", False):
         return {
             "endpoint_only": True,
             "probe_all_http": use_local_fallback,
             "ai_paths_mode": False,
             "active": False,
+            "tls_mode": tls_mode,
         }
     return {
         "endpoint_only": False,
         "probe_all_http": True,
         "ai_paths_mode": True,
         "active": True,
+        "tls_mode": tls_mode,
     }
 
 
@@ -3936,6 +4170,9 @@ def main() -> None:
             validate_credentials=args.validate_credentials,
             target_host=args.target_host,
             output_json=args.output_json,
+            report=args.report,
+            report_redact_secrets=args.report_redact_secrets,
+            report_include_secrets=args.report_include_secrets,
             verbose=args.verbose,
             max_vulns=args.max_vulns,
             offline=args.offline,

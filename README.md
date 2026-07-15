@@ -23,6 +23,9 @@ Target formats:
 - Full range: `10.10.10.10-10.10.10.30`
 - `localhost`
 
+Target expansion is capped at 65,536 unique addresses. Larger CIDRs/ranges,
+including broad IPv6 networks, are rejected before address materialization.
+
 ## What It Does
 
 1. Runs TCP discovery with `nmap -Pn -p- --open` unless `--ports` is supplied.
@@ -51,6 +54,7 @@ python one-shot-enum.py 10.10.10.10 --pathfinder --power
 python one-shot-enum.py 10.10.10.0/24 --pathfinder --top 10
 python one-shot-enum.py 10.10.10.0/24 --pathfinder --min-likelihood medium
 python one-shot-enum.py 10.10.10.0/24 --pathfinder --offline
+python one-shot-enum.py 10.10.10.0/24 --pathfinder --report engagement.html
 ```
 
 For each discovered web service, the default recon plan also saves the landing
@@ -78,6 +82,8 @@ PathFinder pass-through flags supported by one-shot-enum:
 - `--hide-discovery`
 - `--hide-findings`
 - `--validate-credentials`
+- `--report [HTML]`
+- `--report-redact-secrets`
 
 `--target-host` is rarely needed because one-shot-enum writes a per-host loot
 layout that PathFinder can attribute automatically.
@@ -89,6 +95,19 @@ file untouched cannot overwrite its prior provenance. AI loot embeds the full
 one-shot-enum invocation directly. PathFinder preserves every command verbatim,
 including credentials supplied by the operator.
 
+HTML reports are self-contained and offline. PathFinder preserves findings,
+evidence, and producer commands by default; use `--report-redact-secrets` to
+create a sanitized copy. Treat the default report as sensitive engagement loot.
+
+Post-foothold SharpHound output can remain zipped: PathFinder detects timestamped
+`*_users.json`/`*_domains.json` collections inside the archive and selects the
+newest export. Pypykatz or lsassy JSON can also be dropped beneath the relevant
+per-host loot directory; PathFinder separates cleartext password reuse, valid NT
+pass-the-hash material, and crack-first NetNTLMv2/Kerberos/DCC2/DPAPI material.
+Those owned identities are correlated only with direct SharpHound ACL and
+delegation edges; PathFinder surfaces zero-hop wins and one direct high-value
+target hint without performing transitive BloodHound traversal.
+
 ## Defaults
 
 - Loot directory: `loot/`
@@ -98,6 +117,8 @@ including credentials supplied by the operator.
 - Per-host recon concurrency: 2 tools
 - Tool idle timeout: `--run-timeout 180`
 - Nmap timeout: `--scan-timeout 1800`
+- AI probe response cap: 1 MiB; cross-host, cross-port, and cross-scheme redirects are blocked
+- AI TLS policy: `--ai-tls auto` verifies first, then retries certificate failures unverified and labels the result; use `verify` or `insecure` to force either behavior
 - Default web tools: WhatWeb, ffuf, Nikto, plus WPScan only when WordPress is detected
 - `--power`: adds nuclei
 - SQLMap: never fired automatically; PathFinder can parse SQLMap logs you provide

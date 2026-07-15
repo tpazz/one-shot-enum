@@ -19,6 +19,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 # one-shot-enum.py has a hyphen, so load it by path rather than importing.
 ROOT = Path(__file__).resolve().parent.parent
@@ -58,6 +59,18 @@ class TargetExpansionTests(unittest.TestCase):
     def test_dedup_and_sort(self):
         out = ose.normalize_targets(["10.10.10.20", "10.10.10.5", "10.10.10.5"])
         self.assertEqual(out, ["10.10.10.5", "10.10.10.20"])
+
+    def test_oversized_ipv4_and_ipv6_networks_are_rejected_before_expansion(self):
+        for target in ("10.0.0.0/8", "2001:db8::/64"):
+            with self.subTest(target=target), self.assertRaises(ValueError):
+                ose.expand_target(target)
+
+    def test_expansion_limit_allows_bounded_network(self):
+        self.assertEqual(len(ose.expand_target("192.0.2.0/24")), 254)
+
+    def test_combined_target_inputs_are_capped(self):
+        with self.assertRaises(ValueError):
+            ose.normalize_targets(["10.0.0.0/16", "192.0.2.1-10"])
 
 
 class PortParsingTests(unittest.TestCase):
@@ -104,6 +117,172 @@ class ProbeResponseInterestTests(unittest.TestCase):
 
     def test_missing_status_not_interesting(self):
         self.assertFalse(ose.is_interesting_probe_response({}))
+
+
+class HttpResponseHardeningTests(unittest.TestCase):
+    class _Response:
+        def __init__(self, body=b"ok", headers=None, status=200):
+            self.body = body
+            self.headers = headers or {}
+            self.status = status
+            self.read_size = None
+
+        def read(self, size=-1):
+            self.read_size = size
+            return self.body[:size]
+
+        def getcode(self):
+            return self.status
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def test_http_body_read_is_bounded_to_cap_plus_one(self):
+        response = self._Response(b"x" * (ose.MAX_HTTP_RESPONSE_BYTES + 1))
+        with self.assertRaises(ValueError):
+            ose._read_bounded_http_body(response)
+        self.assertEqual(response.read_size, ose.MAX_HTTP_RESPONSE_BYTES + 1)
+
+    def test_content_length_is_rejected_before_body_read(self):
+        response = self._Response(headers={
+            "Content-Length": str(ose.MAX_HTTP_RESPONSE_BYTES + 1),
+        })
+        with self.assertRaises(ValueError):
+            ose._read_bounded_http_body(response)
+        self.assertIsNone(response.read_size)
+
+    def test_http_request_reports_oversized_response_without_parsing_it(self):
+        response = self._Response(headers={
+            "Content-Length": str(ose.MAX_HTTP_RESPONSE_BYTES + 1),
+        })
+        with patch.object(ose, "_open_same_origin", return_value=response):
+            result = ose.http_request("http://10.0.0.5/api")
+        self.assertFalse(result["ok"])
+        self.assertIn("exceeds", result["error"])
+
+    def test_ai_tls_auto_retries_only_certificate_failures_unverified(self):
+        certificate_error = ose.urllib.error.URLError(
+            ose.ssl.SSLCertVerificationError(1, "self-signed certificate")
+        )
+        response = self._Response(body=b'{"models": []}', headers={
+            "Content-Type": "application/json",
+        })
+        with patch.object(
+            ose, "_open_same_origin", side_effect=[certificate_error, response]
+        ) as opener:
+            result = ose.http_request("https://10.0.0.5/v1/models", tls_mode="auto")
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["tls_unverified"])
+        self.assertEqual(
+            [call.kwargs["verify_tls"] for call in opener.call_args_list],
+            [True, False],
+        )
+
+    def test_ai_tls_auto_does_not_retry_non_certificate_errors(self):
+        with patch.object(
+            ose,
+            "_open_same_origin",
+            side_effect=ose.urllib.error.URLError("connection refused"),
+        ) as opener:
+            result = ose.http_request("https://10.0.0.5/v1/models", tls_mode="auto")
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["tls_unverified"])
+        opener.assert_called_once()
+
+    def test_ai_tls_verify_and_insecure_modes_are_deterministic(self):
+        for mode, expected_verify, expected_unverified in (
+            ("verify", True, False),
+            ("insecure", False, True),
+        ):
+            with self.subTest(mode=mode):
+                response = self._Response()
+                with patch.object(ose, "_open_same_origin", return_value=response) as opener:
+                    result = ose.http_request("https://10.0.0.5/", tls_mode=mode)
+                self.assertEqual(opener.call_args.kwargs["verify_tls"], expected_verify)
+                self.assertEqual(result["tls_unverified"], expected_unverified)
+
+    def test_unverified_ai_tls_is_visible_in_rendered_output(self):
+        lines = ose.llm_enum_lines({
+            "openapi_status": 200,
+            "openapi_url": "https://10.0.0.5/openapi.json",
+            "tls_mode": "auto",
+            "tls_unverified": True,
+            "probe_hits": [],
+            "probe_count": 0,
+        })
+        self.assertIn("retried without verification", "\n".join(lines))
+
+        insecure_lines = ose.llm_enum_lines({
+            "openapi_status": 200,
+            "openapi_url": "https://10.0.0.5/openapi.json",
+            "tls_mode": "insecure",
+            "tls_unverified": True,
+            "probe_hits": [],
+            "probe_count": 0,
+        })
+        self.assertIn("verification disabled", "\n".join(insecure_lines))
+
+    def test_ai_enum_reuses_auto_fallback_for_same_origin_path_probes(self):
+        openapi_response = {
+            "ok": True,
+            "status": 200,
+            "content_type": "application/json",
+            "text": "",
+            "json": {"paths": {"/v1/models": {"get": {}}}},
+            "headers": {},
+            "error": "",
+            "tls_mode": "auto",
+            "tls_unverified": True,
+        }
+        service = make_service(port=8443, service="https", tunnel="ssl")
+        with patch.object(ose, "http_request", return_value=openapi_response), \
+                patch.object(ose, "probe_llm_paths", return_value=[]) as probes:
+            result = ose.enumerate_llm_service(
+                "10.0.0.5", service, active=False, tls_mode="auto"
+            )
+
+        probes.assert_called_once_with(
+            "https://10.0.0.5:8443", tls_mode="insecure"
+        )
+        self.assertEqual(result["tls_mode"], "auto")
+        self.assertTrue(result["tls_unverified"])
+
+    def test_redirect_handler_blocks_cross_host_and_cross_scheme(self):
+        handler = ose._SameOriginRedirectHandler("http://10.0.0.5/api")
+        request = ose.urllib.request.Request("http://10.0.0.5/api")
+        for destination in ("http://10.0.0.6/api", "https://10.0.0.5/api"):
+            with self.subTest(destination=destination), self.assertRaises(ose._BlockedRedirectError):
+                handler.redirect_request(request, None, 302, "Found", {}, destination)
+
+    def test_redirect_handler_allows_same_origin_relative_destination(self):
+        handler = ose._SameOriginRedirectHandler("http://10.0.0.5/api")
+        request = ose.urllib.request.Request("http://10.0.0.5/api")
+        redirected = handler.redirect_request(
+            request, None, 302, "Found", {}, "http://10.0.0.5/next",
+        )
+        self.assertEqual(redirected.full_url, "http://10.0.0.5/next")
+
+
+class NmapReaderEncodingTests(unittest.TestCase):
+    def test_reader_replaces_odd_banner_bytes_without_losing_later_output(self):
+        child = (
+            "import os; "
+            "os.write(1, b'80/tcp open\\n' + bytes(range(128, 256)) "
+            "+ b'\\n443/tcp open\\n')"
+        )
+        with redirect_stdout(io.StringIO()):
+            returncode, output = ose.run_nmap_with_progress(
+                [sys.executable, "-c", child], "test", "ENCODING"
+            )
+
+        self.assertEqual(returncode, 0)
+        self.assertIn("80/tcp open", output)
+        self.assertIn("443/tcp open", output)
 
 
 class AgentProfileInferenceTests(unittest.TestCase):
@@ -221,6 +400,27 @@ class GeneratedCommandTests(unittest.TestCase):
         cmds = self._commands(wordlist="/opt/word lists/raft.txt")
         self.assertIn("'/opt/word lists/raft.txt'", cmds["ffuf"])
 
+    def test_all_bash_builders_quote_host_metacharacters(self):
+        hostile = "10.0.0.5; touch /tmp/pwned"
+        services = [
+            make_service(port=80, service="http"),
+            make_service(port=445, service="smb"),
+            make_service(port=6379, service="redis"),
+            make_service(port=873, service="rsync"),
+            make_service(port=25, service="smtp"),
+            make_service(port=88, service="kerberos-sec"),
+        ]
+        suggestions = ose.suggest_for_host(
+            hostile, services, [make_service(port=161, service="snmp", protocol="udp")],
+            "loot", "/wl.txt", "/users.txt",
+        )
+        bash_commands = [item["command"] for item in suggestions if item["shell"] == "bash"]
+        self.assertTrue(bash_commands)
+        for command in bash_commands:
+            tokens = ose.shlex.split(command, posix=True)
+            self.assertNotIn("touch", tokens)
+            self.assertNotIn("/tmp/pwned", tokens)
+
     def test_default_paths_are_not_over_quoted(self):
         # Clean default paths need no quoting - shlex.quote leaves them bare.
         cmds = self._commands()
@@ -270,14 +470,23 @@ class GeneratedCommandTests(unittest.TestCase):
         self.assertIn("kerbrute userenum -d researchmco.ai", cmds["kerbrute"])
         self.assertIn("impacket-GetNPUsers researchmco.ai/", cmds["impacket-GetNPUsers"])
 
+    def test_sharphound_suggestion_keeps_archive_for_pathfinder(self):
+        suggestion = next(
+            item for item in ose._post_foothold_suggestions("10.0.0.5", "loot/10.0.0.5")
+            if item["tool"] == "SharpHound"
+        )
+        self.assertEqual(suggestion["parser"], "sharphound_dir")
+        self.assertIn(".zip directly", suggestion["note"])
+        self.assertNotIn("unzip", suggestion["note"].lower())
+
     def test_generated_script_comments_placeholder_commands(self):
         suggestions = self._suggestions([make_service(port=88, service="kerberos-sec")])
         with tempfile.TemporaryDirectory() as d:
             paths = ose.write_recon_scripts(Path(d), suggestions, "loot")
             bash = next(p for p in paths if p.name == "pathfinder_recon.sh").read_text(encoding="utf-8")
 
-        self.assertIn("# kerbrute userenum -d <domain>", bash)
-        self.assertIn("# impacket-GetNPUsers <domain>/", bash)
+        self.assertIn("# kerbrute userenum -d '<domain>'", bash)
+        self.assertIn("# impacket-GetNPUsers '<domain>/'", bash)
         self.assertIn("edit placeholders", bash)
 
     def test_generated_script_leaves_inferred_domain_userenum_live(self):
@@ -489,6 +698,7 @@ class PathFinderBridgeTests(unittest.TestCase):
             loot.mkdir()
             out = root / "custom_findings.json"
             cache = root / "github_cache.json"
+            report = root / "engagement.html"
 
             calls = []
             original_run = ose.subprocess.run
@@ -504,6 +714,8 @@ class PathFinderBridgeTests(unittest.TestCase):
                     validate_credentials=True,
                     target_host="10.0.0.5",
                     output_json=str(out),
+                    report=str(report),
+                    report_redact_secrets=True,
                     verbose=2,
                     max_vulns=25,
                     offline=True,
@@ -520,6 +732,9 @@ class PathFinderBridgeTests(unittest.TestCase):
             cmd, cwd = calls[0]
             self.assertEqual(cwd, str(pf))
             self.assertIn(str(out), cmd)
+            self.assertIn("--report", cmd)
+            self.assertIn(str(report.resolve()), cmd)
+            self.assertIn("--report-redact-secrets", cmd)
             self.assertIn("--target-host", cmd)
             self.assertIn("10.0.0.5", cmd)
             self.assertEqual(cmd.count("-v"), 2)
@@ -572,6 +787,31 @@ class PathFinderBridgeTests(unittest.TestCase):
         self.assertIn("ffuf", result.stdout)
         self.assertIn(command, result.stdout)
 
+    @unittest.skipUnless(_HAS_PATHFINDER, "PathFinder sibling repo not present")
+    def test_run_pathfinder_creates_redacted_html_report(self):
+        secret = "ReportOnlySecret!42"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            loot = root / "loot"
+            host_dir = loot / "10.0.0.5"
+            host_dir.mkdir(parents=True)
+            (host_dir / "nxc_smb.txt").write_text(
+                "SMB 10.0.0.5 445 HOST [*] Windows Server 2022\n"
+                f"SMB 10.0.0.5 445 HOST [+] CORP.LOCAL\\alice:{secret}\n",
+                encoding="utf-8",
+            )
+            report = root / "engagement.html"
+            with redirect_stdout(io.StringIO()):
+                ose.run_pathfinder(
+                    str(PATHFINDER_DIR), str(loot), report=str(report),
+                    report_redact_secrets=True, offline=True, no_color=True,
+                )
+
+            self.assertTrue(report.is_file())
+            html = report.read_text(encoding="utf-8")
+            self.assertNotIn(secret, html)
+            self.assertIn("[REDACTED]", html)
+
     def test_default_uses_full_active_ai_options(self):
         opts = ose._llm_enum_options(SimpleNamespace(pathfinder=False, llm_endpoint=False))
 
@@ -580,6 +820,7 @@ class PathFinderBridgeTests(unittest.TestCase):
             "probe_all_http": True,
             "ai_paths_mode": True,
             "active": True,
+            "tls_mode": "auto",
         })
 
     def test_suggest_uses_full_active_ai_options(self):
@@ -590,6 +831,7 @@ class PathFinderBridgeTests(unittest.TestCase):
             "probe_all_http": True,
             "ai_paths_mode": True,
             "active": True,
+            "tls_mode": "auto",
         })
 
     def test_llm_endpoint_remains_quick_ai_peek(self):
@@ -600,7 +842,19 @@ class PathFinderBridgeTests(unittest.TestCase):
             "probe_all_http": False,
             "ai_paths_mode": False,
             "active": False,
+            "tls_mode": "auto",
         })
+
+    def test_ai_tls_mode_is_exposed_on_cli_and_forwarded(self):
+        original_argv = sys.argv
+        try:
+            sys.argv = ["one-shot-enum.py", "10.0.0.5", "--ai-tls", "verify"]
+            args = ose.parse_args()
+        finally:
+            sys.argv = original_argv
+
+        self.assertEqual(args.ai_tls, "verify")
+        self.assertEqual(ose._llm_enum_options(args)["tls_mode"], "verify")
 
     def test_llm_endpoint_can_override_pathfinder_mode(self):
         original_argv = sys.argv
@@ -631,6 +885,8 @@ class PathFinderBridgeTests(unittest.TestCase):
                 ["--offline"],
                 ["--target-host", "10.0.0.5"],
                 ["--output-json", "findings.json"],
+                ["--report", "engagement.html"],
+                ["--report-redact-secrets"],
                 ["--top", "10"],
                 ["--hide-discovery"],
                 ["--hide-findings"],
@@ -651,6 +907,7 @@ class PathFinderBridgeTests(unittest.TestCase):
                 "--offline", "--skip-github", "--skip-searchsploit",
                 "--github-cache", "cache.json", "--target-host", "10.0.0.5",
                 "--output-json", "findings.json", "-vv", "--oscp",
+                "--report", "engagement.html", "--report-redact-secrets",
                 "--top", "10", "--min-likelihood", "medium", "--show-all",
                 "--hide-discovery", "--hide-findings",
                 "--validate-credentials",
@@ -667,6 +924,8 @@ class PathFinderBridgeTests(unittest.TestCase):
         self.assertEqual(args.github_cache, "cache.json")
         self.assertEqual(args.target_host, "10.0.0.5")
         self.assertEqual(args.output_json, "findings.json")
+        self.assertEqual(args.report, "engagement.html")
+        self.assertTrue(args.report_redact_secrets)
         self.assertEqual(args.verbose, 2)
         self.assertTrue(args.oscp)
         self.assertEqual(args.top, 10)
