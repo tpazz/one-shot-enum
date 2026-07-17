@@ -66,6 +66,10 @@ Live runs write exact command/output provenance to
 - Idle/scan timeouts: 180/1800 seconds
 - HTTP response cap: 1 MiB
 - Redirects: same scheme, host, and port only
+- `--power`: nuclei, generic OpenAPI inventory, ffuf redirect-only recursion
+  (depth 2, 20 req/s, 180-second total cap), and bounded vhost discovery for
+  inferred DNS zones
+- DNS services: bounded reverse, record, and AXFR queries for inferred zones
 - Missing optional tools and wordlists are skipped
 
 Per-tool logs are stored under `loot/_logs/`.

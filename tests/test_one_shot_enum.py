@@ -358,11 +358,46 @@ class GeneratedCommandTests(unittest.TestCase):
         self.assertIn("wpscan --url http://10.0.0.5:80", cmds["wpscan"])
         self.assertIn("loot/10.0.0.5/wpscan_80.json", cmds["wpscan"])
 
-    def test_power_adds_nuclei_only(self):
+    def test_power_adds_nuclei_and_bounded_recursive_discovery(self):
         cmds = self._commands(power=True)
         self.assertIn("nuclei -u http://10.0.0.5:80", cmds["nuclei"])
         self.assertIn("loot/10.0.0.5/nuclei_80.jsonl", cmds["nuclei"])
+        recursive = cmds["ffuf-recursive"]
+        self.assertIn("-recursion-strategy default", recursive)
+        self.assertIn(f"-recursion-depth {ose.DEFAULT_RECURSIVE_FFUF_DEPTH}", recursive)
+        self.assertIn(f"-rate {ose.DEFAULT_RECURSIVE_FFUF_RATE}", recursive)
+        self.assertIn(f"-maxtime {ose.DEFAULT_RECURSIVE_FFUF_MAXTIME}", recursive)
+        self.assertIn(f"-maxtime-job {ose.DEFAULT_RECURSIVE_FFUF_MAXTIME_JOB}", recursive)
+        self.assertIn("ffuf_recursive_pages_http_80", recursive)
         self.assertNotIn("sqlmap", cmds)
+
+    def test_power_adds_bounded_vhost_discovery_for_inferred_domain(self):
+        web = make_service(port=80, service="http", scripts="ssl-cert: commonName=dc01.corp.htb")
+        suggestions = ose.suggest_for_host(
+            "10.0.0.5", [web], [], "loot", "/wl.txt", "/users.txt", power=True,
+        )
+        vhost = next(s for s in suggestions if s["tool"] == "ffuf-vhost")
+        self.assertIn("Host: FUZZ.corp.htb", vhost["command"])
+        self.assertIn(f"-rate {ose.DEFAULT_VHOST_FFUF_RATE}", vhost["command"])
+        self.assertIn(f"-maxtime {ose.DEFAULT_VHOST_FFUF_MAXTIME}", vhost["command"])
+        self.assertEqual(vhost["parser"], "ffuf_json")
+
+    def test_dns_suggestions_are_bounded_and_feed_pathfinder(self):
+        dns = make_service(port=53, service="domain")
+        ldap = make_service(port=389, service="ldap", extrainfo="Domain: corp.htb")
+        suggestions = ose.suggest_for_host(
+            "10.0.0.5", [dns, ldap], [], "loot", "/wl.txt", "/users.txt",
+        )
+        dns_jobs = [s for s in suggestions if s["group"] == "dns"]
+        self.assertEqual({s["tool"] for s in dns_jobs}, {"dig-reverse", "dig-axfr", "dig-records"})
+        self.assertTrue(all(s["parser"] == "dns_txt" for s in dns_jobs))
+        axfr = next(s for s in dns_jobs if s["tool"] == "dig-axfr")
+        self.assertIn("corp.htb AXFR +time=5 +tries=1", axfr["command"])
+        self.assertIn("dns_corp.htb_axfr.txt", axfr["command"])
+
+    def test_hostname_contributes_dns_zone(self):
+        domains = ose.infer_dns_domains([make_service(port=80, service="http")], "dev.target.htb")
+        self.assertEqual(domains, ["target.htb"])
 
     def test_smbmap_and_snmpcheck_use_tee_not_redirect(self):
         cmds = self._commands()
@@ -409,6 +444,7 @@ class GeneratedCommandTests(unittest.TestCase):
             make_service(port=873, service="rsync"),
             make_service(port=25, service="smtp"),
             make_service(port=88, service="kerberos-sec"),
+            make_service(port=53, service="domain"),
         ]
         suggestions = ose.suggest_for_host(
             hostile, services, [make_service(port=161, service="snmp", protocol="udp")],
@@ -1028,6 +1064,146 @@ class LlmEnumLootSchemaTests(unittest.TestCase):
             self.assertTrue(all(f["attributes"]["discovery_command"] == invocation
                                 for f in findings))
             self.assertIn("ollama", [f["name"] for f in findings])
+
+
+class GenericOpenApiLootTests(unittest.TestCase):
+    def _service_with_openapi(self):
+        return make_service(
+            port=8080,
+            llm_enum={
+                "base_url": "http://10.0.0.5:8080",
+                "openapi_url": "http://10.0.0.5:8080/openapi.json",
+                "openapi_version": "3.0.3",
+                "openapi_title": "Lab API",
+                "tls_unverified": False,
+                "endpoints": [{
+                    "method": "POST",
+                    "path": "/api/files/{account_id}",
+                    "operation_id": "uploadFile",
+                    "security_declared": True,
+                    "parameters": [
+                        {"name": "account_id", "location": "path", "required": True,
+                         "type": "string"},
+                        {"name": "callback_url", "location": "body", "required": False,
+                         "type": "string"},
+                    ],
+                }],
+                "ai_surfaces": [],
+                "agent_profile": {},
+            },
+        )
+
+    def test_openapi_parser_extracts_parameters_and_enforces_bounds(self):
+        document = {
+            "openapi": "3.0.0",
+            "paths": {
+                "/users/{id}": {
+                    "parameters": [{"name": "id", "in": "path", "required": True,
+                                    "schema": {"type": "integer"}}],
+                    "post": {
+                        "operationId": "updateUser",
+                        "security": [{"bearerAuth": []}],
+                        "requestBody": {"content": {"application/json": {"schema": {
+                            "type": "object",
+                            "required": ["callback_url"],
+                            "properties": {"callback_url": {"type": "string"}},
+                        }}}},
+                    },
+                },
+            },
+        }
+        endpoints = ose.parse_openapi_endpoints(document)
+        self.assertEqual(len(endpoints), 1)
+        self.assertEqual(endpoints[0]["operation_id"], "updateUser")
+        self.assertTrue(endpoints[0]["security_declared"])
+        self.assertEqual([item["name"] for item in endpoints[0]["parameters"]],
+                         ["id", "callback_url"])
+
+    def test_openapi_parser_resolves_refs_and_preserves_parameter_identity(self):
+        document = {
+            "openapi": "3.0.3",
+            "components": {
+                "parameters": {
+                    "Filter": {"name": "filter", "in": "query", "required": False,
+                               "schema": {"type": "string"}},
+                },
+                "schemas": {
+                    "Update": {
+                        "type": "object",
+                        "required": ["id"],
+                        "properties": {
+                            "id": {"type": "integer"},
+                            "callback_url": {"type": "string"},
+                        },
+                    },
+                },
+            },
+            "paths": {
+                "/users/{id}": {
+                    "parameters": [
+                        {"name": "id", "in": "path", "required": True,
+                         "schema": {"type": "string"}},
+                        {"$ref": "#/components/parameters/Filter"},
+                    ],
+                    "patch": {
+                        "parameters": [
+                            {"name": "filter", "in": "query", "required": True,
+                             "schema": {"type": "integer"}},
+                        ],
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/Update"},
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        }
+        endpoint = ose.parse_openapi_endpoints(document)[0]
+        details = {(item["name"], item["location"]): item
+                   for item in endpoint["parameters"]}
+        self.assertEqual(details[("filter", "query")]["type"], "integer")
+        self.assertTrue(details[("filter", "query")]["required"])
+        self.assertIn(("id", "path"), details)
+        self.assertIn(("id", "body"), details)
+        self.assertIn(("callback_url", "body"), details)
+
+    def test_power_endpoint_mode_probes_all_http_for_generic_openapi(self):
+        options = ose._llm_enum_options(SimpleNamespace(
+            llm_endpoint=True, power=True, ai_tls="auto",
+        ))
+        self.assertTrue(options["endpoint_only"])
+        self.assertTrue(options["probe_all_http"])
+
+    def test_writes_openapi_payload_without_ai_fingerprint(self):
+        with tempfile.TemporaryDirectory() as d:
+            invocation = "python one-shot-enum.py 10.0.0.5 --power --pathfinder"
+            written = ose.write_openapi_enum_loot(
+                "10.0.0.5", self._service_with_openapi(), d,
+                discovery_command=invocation,
+            )
+            self.assertIsNotNone(written)
+            payload = json.loads(Path(written).read_text(encoding="utf-8"))
+            self.assertEqual(payload["type"], "openapi_enum")
+            self.assertEqual(payload["openapi_title"], "Lab API")
+            self.assertEqual(payload["endpoints"][0]["parameters"][1]["name"],
+                             "callback_url")
+
+    @unittest.skipUnless(_HAS_PATHFINDER, "PathFinder sibling repo not present")
+    def test_pathfinder_parses_written_generic_openapi_loot(self):
+        from parsers.initial_foothold.openapi_parser import parse_openapi_json
+        from main.finding_schema import validate_findings
+        with tempfile.TemporaryDirectory() as d:
+            written = ose.write_openapi_enum_loot(
+                "10.0.0.5", self._service_with_openapi(), d,
+                discovery_command="python one-shot-enum.py 10.0.0.5 --power --pathfinder",
+            )
+            findings = parse_openapi_json(str(written))
+            validate_findings(findings)
+            self.assertTrue(any(item["entity_type"] == "api_surface" for item in findings))
+            self.assertTrue(any(item["name"] == "ssrf:callback_url" for item in findings))
 
 
 if __name__ == "__main__":

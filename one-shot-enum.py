@@ -810,6 +810,9 @@ OPENAPI_CANDIDATE_PATHS = (
     "/swagger/v1/swagger.json",
     "/swagger.json",
 )
+MAX_OPENAPI_ENDPOINTS = 500
+MAX_OPENAPI_PARAMETERS_PER_ENDPOINT = 50
+MAX_OPENAPI_LOCAL_REF_DEPTH = 12
 LLM_PROBE_PATHS = (
     "/.well-known/security.txt",
     "/.well-known/openid-configuration",
@@ -1611,7 +1614,127 @@ def probe_llm_paths(base_url: str, tls_mode: str = "verify") -> List[Dict[str, A
     return sorted(hits, key=lambda hit: hit["index"])
 
 
-def parse_openapi_endpoints(openapi_doc: Any) -> List[Dict[str, str]]:
+def _resolve_openapi_local_ref(openapi_doc: Dict[str, Any], value: Any,
+                               seen: Optional[Set[str]] = None,
+                               depth: int = 0) -> Dict[str, Any]:
+    """Resolve a bounded local JSON Pointer while preserving allowed siblings."""
+    if not isinstance(value, dict):
+        return {}
+    ref = value.get("$ref")
+    if not ref:
+        return value
+    if (not isinstance(ref, str) or not ref.startswith("#/")
+            or depth >= MAX_OPENAPI_LOCAL_REF_DEPTH):
+        return {}
+    seen = set(seen or ())
+    if ref in seen:
+        return {}
+    seen.add(ref)
+    target: Any = openapi_doc
+    for raw_token in ref[2:].split("/"):
+        token = raw_token.replace("~1", "/").replace("~0", "~")
+        if not isinstance(target, dict) or token not in target:
+            return {}
+        target = target[token]
+    resolved = _resolve_openapi_local_ref(openapi_doc, target, seen, depth + 1)
+    if not isinstance(resolved, dict):
+        return {}
+    merged = dict(resolved)
+    merged.update({key: item for key, item in value.items() if key != "$ref"})
+    return merged
+
+
+def _openapi_schema_properties(openapi_doc: Dict[str, Any], schema: Any,
+                               depth: int = 0) -> Tuple[Dict[str, Any], Set[str]]:
+    if depth >= MAX_OPENAPI_LOCAL_REF_DEPTH:
+        return {}, set()
+    schema = _resolve_openapi_local_ref(openapi_doc, schema)
+    if not schema:
+        return {}, set()
+    properties: Dict[str, Any] = {}
+    required = set(schema.get("required") if isinstance(schema.get("required"), list) else [])
+    branches = schema.get("allOf") if isinstance(schema.get("allOf"), list) else []
+    for branch in branches:
+        branch_properties, branch_required = _openapi_schema_properties(
+            openapi_doc, branch, depth + 1,
+        )
+        properties.update(branch_properties)
+        required.update(branch_required)
+    direct = schema.get("properties")
+    if isinstance(direct, dict):
+        properties.update(direct)
+    return properties, required
+
+
+def _openapi_parameter_details(openapi_doc: Dict[str, Any],
+                               path_item: Dict[str, Any],
+                               operation: Dict[str, Any]) -> List[Dict[str, Any]]:
+    details: List[Dict[str, Any]] = []
+    indexes: Dict[Tuple[str, str], int] = {}
+
+    def add(name: Any, location: Any, required: Any, value_type: Any) -> None:
+        name = str(name or "").strip()
+        location = str(location or "unknown").strip().lower() or "unknown"
+        if not name:
+            return
+        detail = {
+            "name": name,
+            "location": location,
+            "required": bool(required),
+            "type": str(value_type or "unknown"),
+        }
+        key = (name.lower(), location)
+        if key in indexes:
+            details[indexes[key]] = detail
+        elif len(details) < MAX_OPENAPI_PARAMETERS_PER_ENDPOINT:
+            indexes[key] = len(details)
+            details.append(detail)
+
+    for container in (path_item, operation):
+        parameters = container.get("parameters") if isinstance(container, dict) else None
+        if not isinstance(parameters, list):
+            continue
+        for parameter in parameters:
+            parameter = _resolve_openapi_local_ref(openapi_doc, parameter)
+            if not parameter:
+                continue
+            name = str(parameter.get("name") or "").strip()
+            location = str(parameter.get("in") or "unknown")
+            schema = _resolve_openapi_local_ref(openapi_doc, parameter.get("schema"))
+            if location.lower() == "body":
+                properties, required = _openapi_schema_properties(openapi_doc, schema)
+                if properties:
+                    for property_name, definition in properties.items():
+                        definition = _resolve_openapi_local_ref(openapi_doc, definition)
+                        add(property_name, "body", property_name in required,
+                            definition.get("type") if definition else "unknown")
+                    continue
+            value_type = schema.get("type") if schema else parameter.get("type")
+            add(name, location, parameter.get("required"), value_type)
+            if len(details) >= MAX_OPENAPI_PARAMETERS_PER_ENDPOINT:
+                return details
+
+    request_body = _resolve_openapi_local_ref(
+        openapi_doc,
+        operation.get("requestBody") if isinstance(operation, dict) else None,
+    )
+    content = request_body.get("content") if isinstance(request_body, dict) else None
+    if isinstance(content, dict):
+        for media in content.values():
+            schema = _resolve_openapi_local_ref(
+                openapi_doc, media.get("schema") if isinstance(media, dict) else None,
+            )
+            properties, required = _openapi_schema_properties(openapi_doc, schema)
+            for name, definition in properties.items():
+                definition = _resolve_openapi_local_ref(openapi_doc, definition)
+                add(name, "body", name in required,
+                    definition.get("type") if definition else "unknown")
+                if len(details) >= MAX_OPENAPI_PARAMETERS_PER_ENDPOINT:
+                    return details
+    return details
+
+
+def parse_openapi_endpoints(openapi_doc: Any) -> List[Dict[str, Any]]:
     if not isinstance(openapi_doc, dict):
         return []
 
@@ -1619,17 +1742,25 @@ def parse_openapi_endpoints(openapi_doc: Any) -> List[Dict[str, str]]:
     if not isinstance(paths, dict):
         return []
 
-    endpoints: List[Dict[str, str]] = []
-    for path, operations in paths.items():
-        if not isinstance(operations, dict):
+    endpoints: List[Dict[str, Any]] = []
+    for path, path_item in paths.items():
+        path_item = _resolve_openapi_local_ref(openapi_doc, path_item)
+        if not path_item:
             continue
-        for method in operations:
+        for method, operation in path_item.items():
             method_name = str(method)
-            if method_name.lower() in HTTP_METHODS:
+            if method_name.lower() in HTTP_METHODS and isinstance(operation, dict):
                 endpoints.append({
                     "method": method_name.upper(),
                     "path": str(path),
+                    "parameters": _openapi_parameter_details(openapi_doc, path_item, operation),
+                    "operation_id": str(operation.get("operationId") or ""),
+                    "security_declared": (
+                        "security" in operation or "security" in openapi_doc
+                    ),
                 })
+                if len(endpoints) >= MAX_OPENAPI_ENDPOINTS:
+                    return endpoints
 
     return endpoints
 
@@ -1882,11 +2013,20 @@ def apply_openapi_response(result: Dict[str, Any], response: Dict[str, Any], url
     result["openapi_status"] = response.get("status")
     result["openapi_error"] = response.get("error", "")
     result["endpoints"] = []
+    result["openapi_version"] = ""
+    result["openapi_title"] = ""
 
     if not response.get("ok") and not result["openapi_error"]:
         result["openapi_error"] = "HTTP request failed"
     elif response.get("json") is not None:
-        result["endpoints"] = parse_openapi_endpoints(response["json"])
+        document = response["json"]
+        result["endpoints"] = parse_openapi_endpoints(document)
+        if isinstance(document, dict):
+            result["openapi_version"] = str(
+                document.get("openapi") or document.get("swagger") or ""
+            )
+            info_block = document.get("info") if isinstance(document.get("info"), dict) else {}
+            result["openapi_title"] = str(info_block.get("title") or "")
     elif not result["openapi_error"]:
         result["openapi_error"] = "Response was not valid JSON"
 
@@ -1908,6 +2048,8 @@ def enumerate_llm_service(target: str,
         "openapi_url": "",
         "openapi_status": None,
         "openapi_error": "",
+        "openapi_version": "",
+        "openapi_title": "",
         "endpoints": [],
         "probe_count": len(LLM_PROBE_PATHS),
         "probe_hits": [],
@@ -2521,6 +2663,12 @@ DEFAULT_WEB_WORDLIST = "/usr/share/seclists/Discovery/Web-Content/raft-medium-di
 DEFAULT_USER_WORDLIST = "/usr/share/seclists/Usernames/top-usernames-shortlist.txt"
 PATHFINDER_SCAN_CMD = "python3 -m main.pathfinder scan"
 DEFAULT_FFUF_MAXTIME = 180
+DEFAULT_RECURSIVE_FFUF_MAXTIME = 180
+DEFAULT_RECURSIVE_FFUF_MAXTIME_JOB = 45
+DEFAULT_RECURSIVE_FFUF_DEPTH = 2
+DEFAULT_RECURSIVE_FFUF_RATE = 20
+DEFAULT_VHOST_FFUF_MAXTIME = 120
+DEFAULT_VHOST_FFUF_RATE = 20
 
 # --pathfinder concurrency: one lane per host, this many tools at once within a lane.
 # Concurrency auto-scales with the number of hosts (lanes run in parallel), so a
@@ -2541,6 +2689,7 @@ WEB_HTTPS_PORTS = {443, 8443, 8444, 9443, 2083, 2087, 2096}
 SMB_PORTS = {139, 445}
 LDAP_PORTS = {389, 636, 3268, 3269}
 KERBEROS_PORTS = {88}
+DNS_PORTS = {53}
 SNMP_PORTS = {161}
 NFS_PORTS = {111, 2049}
 REDIS_PORTS = {6379}
@@ -2553,6 +2702,9 @@ PASS_PLACEHOLDER = "<pass>"
 PLACEHOLDERS = (DOMAIN_PLACEHOLDER, USER_PLACEHOLDER, PASS_PLACEHOLDER)
 DNS_DOMAIN_RE = re.compile(r"(?i)\b(?:DNS_Domain_Name|Domain):\s*([a-z0-9][a-z0-9.-]*\.[a-z]{2,})\b")
 CERT_CN_RE = re.compile(r"(?i)\bcommonName=([a-z0-9_-]+\.[a-z0-9][a-z0-9.-]*\.[a-z]{2,})\b")
+FQDN_CANDIDATE_RE = re.compile(
+    r"(?i)(?<![a-z0-9_.-])([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\.[a-z][a-z0-9-]{1,62})(?![a-z0-9_.-])"
+)
 
 
 def _has_placeholder(value: str) -> bool:
@@ -2608,6 +2760,32 @@ def infer_ad_domain(tcp_services: List[Service]) -> str:
             if cn_match:
                 fallback = _domain_from_fqdn(cn_match.group(1))
     return fallback
+
+
+def infer_dns_domains(tcp_services: List[Service], hostname: str = "") -> List[str]:
+    """Return a small, ordered set of DNS zones suggested by Nmap evidence."""
+    domains: List[str] = []
+
+    def add(candidate: str) -> None:
+        domain = _domain_from_fqdn(candidate)
+        if domain and domain not in domains:
+            domains.append(domain)
+
+    ad_domain = infer_ad_domain(tcp_services)
+    if ad_domain:
+        domains.append(ad_domain)
+    add(hostname)
+    for service in tcp_services:
+        blob = "\n".join([
+            str(service.get("scripts", "")),
+            str(service.get("extrainfo", "")),
+            str(service.get("product", "")),
+        ])
+        for match in FQDN_CANDIDATE_RE.finditer(blob):
+            add(match.group(1))
+            if len(domains) >= 3:
+                return domains
+    return domains[:3]
 
 
 def host_loot_dir(loot: str, host: str) -> str:
@@ -2703,6 +2881,53 @@ def write_llm_enum_loot(host: str, service: Service, loot: str,
     return out
 
 
+def write_openapi_enum_loot(host: str, service: Service, loot: str,
+                            discovery_command: str = "") -> Optional[Path]:
+    """Write a bounded generic OpenAPI inventory for PathFinder under --power."""
+    llm_enum = service.get("llm_enum")
+    if not isinstance(llm_enum, dict):
+        return None
+    raw_endpoints = llm_enum.get("endpoints")
+    if not isinstance(raw_endpoints, list) or not raw_endpoints:
+        return None
+    try:
+        port_int = int(service.get("port"))
+    except (TypeError, ValueError):
+        return None
+    if not 0 < port_int <= 65535:
+        return None
+    endpoints = [
+        endpoint for endpoint in raw_endpoints[:MAX_OPENAPI_ENDPOINTS]
+        if isinstance(endpoint, dict)
+    ]
+    if not endpoints:
+        return None
+    payload = {
+        "tool": "one-shot-enum",
+        "type": "openapi_enum",
+        "discovery_command": discovery_command or None,
+        "host": host,
+        "port": port_int,
+        "base_url": llm_enum.get("base_url"),
+        "openapi_url": llm_enum.get("openapi_url"),
+        "openapi_version": llm_enum.get("openapi_version"),
+        "openapi_title": llm_enum.get("openapi_title"),
+        "tls_unverified": bool(llm_enum.get("tls_unverified")),
+        "service": {
+            "name": service.get("service", ""),
+            "product": service.get("product", ""),
+            "version": service.get("version", ""),
+        },
+        "endpoints": endpoints,
+        "bounded": len(raw_endpoints) >= MAX_OPENAPI_ENDPOINTS,
+    }
+    host_dir = Path(host_loot_dir(loot, host))
+    host_dir.mkdir(parents=True, exist_ok=True)
+    out = host_dir / f"openapi_{safe_name(str(port_int))}.json"
+    write_text(out, json.dumps(payload, indent=2))
+    return out
+
+
 def _suggestion(host: str, group: str, tool: str, command: str, parser: str,
                 pending: bool = False, gated: bool = False, shell: str = "bash",
                 note: str = "", output_file: str = "") -> Dict[str, Any]:
@@ -2766,7 +2991,8 @@ def _lootfile(loot: str, name: str) -> str:
 
 
 def _web_suggestions(host: str, service: Service, loot: str, wordlist: str,
-                     power: bool = False) -> List[Dict[str, Any]]:
+                     power: bool = False,
+                     dns_domains: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     scheme = _web_scheme(service)
     port = _svc_port(service)
     base = f"{scheme}://{host}:{port}"
@@ -2795,12 +3021,72 @@ def _web_suggestions(host: str, service: Service, loot: str, wordlist: str,
             _suggestion(host, group, "nuclei",
                         f"nuclei -u {_bash_arg(base)} -jsonl -o {_lootpath(loot, f'nuclei_{port}.jsonl')}", "nuclei_jsonl",
                         output_file=_lootfile(loot, f"nuclei_{port}.jsonl")),
+            _suggestion(
+                host, group, "ffuf-recursive",
+                f"ffuf -u {_bash_arg(base + '/FUZZ')} -w {wl}{k} "
+                f"-recursion -recursion-depth {_bash_arg(DEFAULT_RECURSIVE_FFUF_DEPTH)} "
+                f"-recursion-strategy default -rate {_bash_arg(DEFAULT_RECURSIVE_FFUF_RATE)} "
+                f"-maxtime {_bash_arg(DEFAULT_RECURSIVE_FFUF_MAXTIME)} "
+                f"-maxtime-job {_bash_arg(DEFAULT_RECURSIVE_FFUF_MAXTIME_JOB)} "
+                f"-of json -o {_lootpath(loot, f'ffuf_recursive_{port}.json')} "
+                f"-od {_lootpath(loot, f'ffuf_recursive_pages_{scheme}_{port}')}",
+                "ffuf_json",
+                note=(
+                    "bounded redirect-only recursion: depth "
+                    f"{DEFAULT_RECURSIVE_FFUF_DEPTH}, rate {DEFAULT_RECURSIVE_FFUF_RATE}/s, "
+                    f"total {DEFAULT_RECURSIVE_FFUF_MAXTIME}s"
+                ),
+                output_file=_lootfile(loot, f"ffuf_recursive_{port}.json"),
+            ),
         ])
+        for domain in (dns_domains or [])[:3]:
+            safe_domain = safe_name(domain)
+            out.append(_suggestion(
+                host, group, "ffuf-vhost",
+                f"ffuf -u {_bash_arg(base + '/')} -H {_bash_arg('Host: FUZZ.' + domain)} "
+                f"-w {wl}{k} -ac -rate {_bash_arg(DEFAULT_VHOST_FFUF_RATE)} "
+                f"-maxtime {_bash_arg(DEFAULT_VHOST_FFUF_MAXTIME)} "
+                f"-of json -o {_lootpath(loot, f'ffuf_vhost_{port}_{safe_domain}.json')}",
+                "ffuf_json",
+                note=f"bounded vhost discovery for inferred zone {domain}",
+                output_file=_lootfile(loot, f"ffuf_vhost_{port}_{safe_domain}.json"),
+            ))
     if _looks_wordpress(service):
         out.append(_suggestion(host, group, "wpscan",
                    f"wpscan --url {_bash_arg(base)} --format json -o {_lootpath(loot, f'wpscan_{port}.json')} --disable-tls-checks",
                    "wpscan_json", output_file=_lootfile(loot, f"wpscan_{port}.json")))
     return out
+
+
+def _dns_suggestions(host: str, loot: str, domains: List[str]) -> List[Dict[str, Any]]:
+    q_server = _bash_arg("@" + host)
+    suggestions = [
+        _suggestion(
+            host, "dns", "dig-reverse",
+            f"dig {q_server} -x {_bash_arg(host)} +time=5 +tries=1 +noall +answer | "
+            f"tee {_lootpath(loot, 'dns_reverse.txt')}",
+            "dns_txt", output_file=_lootfile(loot, "dns_reverse.txt"),
+        ),
+    ]
+    for domain in domains[:3]:
+        safe_domain = safe_name(domain)
+        suggestions.extend([
+            _suggestion(
+                host, "dns", "dig-axfr",
+                f"dig {q_server} {_bash_arg(domain)} AXFR +time=5 +tries=1 +noall +answer | "
+                f"tee {_lootpath(loot, f'dns_{safe_domain}_axfr.txt')}",
+                "dns_txt", note=f"bounded AXFR check for inferred zone {domain}",
+                output_file=_lootfile(loot, f"dns_{safe_domain}_axfr.txt"),
+            ),
+            _suggestion(
+                host, "dns", "dig-records",
+                f"dig {q_server} {_bash_arg(domain)} ANY +time=5 +tries=1 +noall +answer | "
+                f"tee {_lootpath(loot, f'dns_{safe_domain}_records.txt')}",
+                "dns_txt", note=f"bounded record query for inferred zone {domain}",
+                output_file=_lootfile(loot, f"dns_{safe_domain}_records.txt"),
+            ),
+        ])
+    return suggestions
 
 
 def _smb_suggestions(host: str, loot: str) -> List[Dict[str, Any]]:
@@ -2923,13 +3209,16 @@ def suggest_for_host(host: str,
                      loot: str,
                      wordlist: str,
                      userlist: str,
-                     power: bool = False) -> List[Dict[str, Any]]:
+                     power: bool = False,
+                     hostname: str = "") -> List[Dict[str, Any]]:
     suggestions: List[Dict[str, Any]] = []
     has_smb = False
     has_ad = False
     has_snmp = False
     has_nfs = False
     has_rsync = False
+    has_dns = False
+    dns_domains = infer_dns_domains(tcp_services, hostname)
 
     # Per-host loot subdirectory so PathFinder attributes every file to this host
     # and files from different hosts never collide.
@@ -2938,7 +3227,10 @@ def suggest_for_host(host: str,
     for service in tcp_services:
         port = _svc_port(service)
         if _is_web_service(service):
-            suggestions.extend(_web_suggestions(host, service, host_loot, wordlist, power=power))
+            suggestions.extend(_web_suggestions(
+                host, service, host_loot, wordlist, power=power,
+                dns_domains=dns_domains,
+            ))
         if _svc_name(service) in {"microsoft-ds", "netbios-ssn", "smb"} or port in SMB_PORTS:
             has_smb = True
         if "ldap" in _svc_name(service) or "kerberos" in _svc_name(service) \
@@ -2953,6 +3245,8 @@ def suggest_for_host(host: str,
             has_rsync = True
         if "smtp" in _svc_name(service) or port in SMTP_PORTS:
             suggestions.extend(_smtp_suggestions(host, service, host_loot, userlist))
+        if "domain" in _svc_name(service) or port in DNS_PORTS:
+            has_dns = True
 
     for service in list(udp_services) + list(tcp_services):
         if "snmp" in _svc_name(service) or _svc_port(service) in SNMP_PORTS:
@@ -2962,6 +3256,8 @@ def suggest_for_host(host: str,
             has_nfs = True
         if "rsync" in _svc_name(service) or _svc_port(service) in RSYNC_PORTS:
             has_rsync = True
+        if "domain" in _svc_name(service) or _svc_port(service) in DNS_PORTS:
+            has_dns = True
 
     if has_smb:
         suggestions.extend(_smb_suggestions(host, host_loot))
@@ -2971,6 +3267,8 @@ def suggest_for_host(host: str,
         suggestions.extend(_nfs_suggestions(host, host_loot))
     if has_rsync:
         suggestions.extend(_rsync_suggestions(host, host_loot))
+    if has_dns:
+        suggestions.extend(_dns_suggestions(host, host_loot, dns_domains))
     if has_ad:
         suggestions.extend(_ad_suggestions(host, host_loot, userlist, infer_ad_domain(tcp_services)))
     suggestions.extend(_post_foothold_suggestions(host, host_loot))
@@ -3861,7 +4159,7 @@ def _llm_enum_options(args: argparse.Namespace, use_local_fallback: bool = False
     if getattr(args, "llm_endpoint", False):
         return {
             "endpoint_only": True,
-            "probe_all_http": use_local_fallback,
+            "probe_all_http": bool(getattr(args, "power", False) or use_local_fallback),
             "ai_paths_mode": False,
             "active": False,
             "tls_mode": tls_mode,
@@ -4087,10 +4385,19 @@ def main() -> None:
                     )
                     if written_llm:
                         good(f"AI surfaces -> {written_llm}")
+            if args.power:
+                for svc in tcp_services:
+                    written_openapi = write_openapi_enum_loot(
+                        loot_host, svc, LOOT_DIR,
+                        discovery_command=shlex.join([sys.executable, *sys.argv]),
+                    )
+                    if written_openapi:
+                        good(f"OpenAPI inventory -> {written_openapi}")
             host_suggestions = suggest_for_host(
                 loot_host, tcp_services, udp_services,
                 LOOT_DIR, DEFAULT_WEB_WORDLIST, DEFAULT_USER_WORDLIST,
                 power=args.power,
+                hostname=hostname,
             )
             if args.pathfinder_suggest:
                 # Use the same pinned host the loot paths are keyed on.
