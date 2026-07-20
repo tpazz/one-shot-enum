@@ -4,6 +4,115 @@ Fast first-pass enumeration around Nmap, with bounded target expansion,
 service fingerprinting, read-only AI surface checks, and optional PathFinder
 handoff.
 
+## Install and verify
+
+### Supported environment
+
+- Python 3.11, 3.12, or 3.13
+- Kali Linux or another Linux distribution is recommended for the complete
+  reconnaissance workflow
+- Windows is tested for the Python core, but many optional security tools and
+  generated shell commands are Linux-oriented
+
+Only scan systems you own or have explicit permission to test. An isolated lab
+is the safest way to evaluate the integrated workflow.
+
+### Basic one-shot-enum installation
+
+Basic remote scans require Python 3, Git, and Nmap. SecLists supplies the default
+wordlists used by follow-up web and username enumeration.
+
+```bash
+git clone https://github.com/tpazz/one-shot-enum.git
+cd one-shot-enum
+
+sudo apt update
+sudo apt install -y nmap seclists
+
+python3 one-shot-enum.py --help
+```
+
+The script has no mandatory third-party Python packages. A basic scan can now be
+run with:
+
+```bash
+python3 one-shot-enum.py 10.10.10.5
+```
+
+### PathFinder integration
+
+Clone both repositories into the same parent directory. PathFinder's Python
+dependency must be installed before using `--pathfinder`:
+
+```bash
+mkdir pathfinder-toolkit
+cd pathfinder-toolkit
+
+git clone https://github.com/tpazz/one-shot-enum.git
+git clone https://github.com/tpazz/PathFinder.git
+
+python3 -m venv PathFinder/.venv
+source PathFinder/.venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r PathFinder/requirements.txt
+
+cd one-shot-enum
+python one-shot-enum.py --help
+```
+
+The expected layout is:
+
+```text
+pathfinder-toolkit/
+  one-shot-enum/
+  PathFinder/
+```
+
+`--pathfinder-suggest` only generates follow-up commands. `--pathfinder` runs
+the compatible tools currently installed, saves their output beneath `loot/`,
+and launches the sibling PathFinder checkout. Missing optional tools are
+reported and skipped, so the workflow still completes with reduced coverage.
+
+### Optional reconnaissance tools
+
+Install the tools relevant to the services you expect to assess. one-shot-enum
+checks for these binaries before attempting to run them:
+
+| Coverage | Tools used when available |
+| --- | --- |
+| Web | `curl`, `whatweb`, `ffuf`, `nikto` |
+| SMB and Active Directory | `enum4linux-ng`, `smbmap`, NetExec (`nxc` or `netexec`) |
+| DNS | `dig` (commonly supplied by `dnsutils`) |
+| NFS | `showmount` (commonly supplied by `nfs-common`) |
+| SNMP | `snmp-check` |
+| Other services | `redis-cli`, `rsync`, `smtp-user-enum` |
+| `--power` additions | `nuclei`, plus SecLists-backed recursive and virtual-host discovery |
+
+Package availability and names differ between distributions. Install optional
+tools from your distribution or their upstream projects, then verify them with
+`command -v`, for example:
+
+```bash
+command -v nmap ffuf whatweb nikto enum4linux-ng smbmap dig showmount nuclei
+```
+
+Credentialed and post-foothold suggestions may also reference tools such as
+Kerbrute, Certipy, WPScan, LinPEAS, and WinPEAS. These gated commands are printed
+for operator review and are not automatically executed.
+
+### Integrated smoke test
+
+Run this only against an authorised lab target:
+
+```bash
+python one-shot-enum.py 192.168.56.10 \
+  --pathfinder --offline --top 5 --report engagement.html
+```
+
+A successful run prints a service summary, stores per-host artifacts under
+`loot/`, launches PathFinder, prints prioritised next steps, and creates the HTML
+report. Add `--power` only after the base workflow succeeds.
+
 ## Quick Start
 
 ```bash
@@ -118,23 +227,6 @@ Recon [1 host lane(s), 2/host]: 2 running, 5 done, 0 skipped, 0 other
 [+] Per-tool logs: loot/_logs
 [+] Discovery provenance: loot/_pathfinder_provenance.json
 [*] Launching PathFinder on /home/kali/labs/loot (findings -> /home/kali/labs/findings.json)
-```
-
-## Setup
-
-```bash
-sudo apt update
-sudo apt install -y nmap seclists
-python3 -m pip install -r ../PathFinder/requirements.txt
-```
-
-Optional recon commands run when their binaries are available. Keep the repos
-beside each other for automatic handoff:
-
-```text
-Github/
-  one-shot-enum/
-  PathFinder/
 ```
 
 ## Notes
