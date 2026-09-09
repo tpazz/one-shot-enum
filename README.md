@@ -125,7 +125,17 @@ python one-shot-enum.py 10.10.10.5 --pathfinder-suggest
 
 Target formats:
 
-- IPv4, CIDR, short/full ranges, and `localhost`
+- IPv4, hostnames, CIDR, short/full ranges, and `localhost`
+
+Hostname targets are passed to Nmap for resolution, for example:
+
+```bash
+python one-shot-enum.py whatweknow.today --save --outdir scan_results
+```
+
+Use the bare hostname, without `https://`, a path, a port or an escaped dot.
+Hyphenated hostnames are supported. For a proxied site, the resolved IP belongs
+to the proxy/CDN; the network scan does not reveal the hidden origin server.
 - Up to 65,536 unique expanded addresses
 
 ## Workflow

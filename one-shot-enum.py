@@ -7,6 +7,7 @@ Lightweight nmap wrapper for one-shot initial pentest enumeration.
 Features:
 - Accepts:
     - single IPs:         10.10.10.5
+    - hostnames:          whatweknow.today
     - CIDRs:              10.10.10.0/24
     - short ranges:       10.10.10.10-20
     - full ranges:        10.10.10.10-10.10.10.30
@@ -203,6 +204,16 @@ def expand_target(target: str) -> List[str]:
 
     if is_localhost_target(target):
         return ["localhost"]
+
+    # Preserve the hostname for Nmap to resolve and for HTTP Host/SNI probes.
+    # Check before ranges so hyphenated DNS labels are not treated as IP ranges.
+    hostname = target.rstrip('.') if target.endswith('.') else target
+    labels = hostname.split('.')
+    if (len(hostname) <= 253 and not target.endswith('..')
+            and re.search(r'[a-zA-Z]', hostname)
+            and all(re.fullmatch(r'[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?', label)
+                    for label in labels)):
+        return [hostname.lower()]
 
     if "/" in target:
         try:
@@ -3908,7 +3919,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "targets",
         nargs="+",
-        help="IPs, CIDRs, ranges, or localhost",
+        help="IPv4 addresses, hostnames (without https://), CIDRs, ranges, or localhost",
     )
     parser.add_argument(
         "--threads",

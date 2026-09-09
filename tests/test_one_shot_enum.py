@@ -56,6 +56,20 @@ class TargetExpansionTests(unittest.TestCase):
             {"10.10.10.10", "10.10.10.11", "10.10.10.12"},
         )
 
+    def test_hostnames_preserved_and_normalized_without_dns_lookup(self):
+        with patch.object(ose.socket, 'getaddrinfo', side_effect=AssertionError('No DNS during validation')):
+            self.assertEqual(ose.normalize_targets(['WhatWeKnow.today.', 'whatweknow.today']), ['whatweknow.today'])
+            self.assertEqual(ose.expand_target('my-app.example.com'), ['my-app.example.com'])
+            self.assertEqual(ose.expand_target('internal-host'), ['internal-host'])
+
+    def test_invalid_hostname_inputs_rejected(self):
+        for target in ('https://whatweknow.today', 'whatweknow.today:443', r'whatweknow\.today',
+                       '-example.com', 'example-.com', 'example..com', 'example.com..',
+                       'example.com;id', 'example com', '*.example.com', '999.999.999.999',
+                       'a' * 64 + '.com', '.'.join(['a' * 63] * 4)):
+            with self.subTest(target=target), self.assertRaises(ValueError):
+                ose.expand_target(target)
+
     def test_dedup_and_sort(self):
         out = ose.normalize_targets(["10.10.10.20", "10.10.10.5", "10.10.10.5"])
         self.assertEqual(out, ["10.10.10.5", "10.10.10.20"])
