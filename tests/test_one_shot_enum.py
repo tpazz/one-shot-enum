@@ -987,6 +987,67 @@ class PathFinderBridgeTests(unittest.TestCase):
         self.assertTrue(args.validate_credentials)
 
 
+class ReconExecModeTests(unittest.TestCase):
+    """--recon-exec runs the recon pipeline into the loot tree but stops short
+    of invoking the bundled PathFinder (a separately installed PathFinder reads
+    the loot afterwards)."""
+
+    def _parse(self, *argv):
+        original_argv = sys.argv
+        try:
+            sys.argv = ["one-shot-enum.py", *argv]
+            return ose.parse_args()
+        finally:
+            sys.argv = original_argv
+
+    def test_recon_exec_implies_pathfinder_recon_pipeline(self):
+        # --recon-exec reuses the --pathfinder suggestion/run machinery, so it
+        # must flip args.pathfinder on (that is what the recon gates key off).
+        args = self._parse("10.0.0.5", "--recon-exec")
+        self.assertTrue(args.recon_exec)
+        self.assertTrue(args.pathfinder)
+        self.assertFalse(args.pathfinder_suggest)
+
+    def test_recon_exec_conflicts_with_pathfinder_and_suggest(self):
+        for extra in (["--pathfinder"], ["--pathfinder-suggest"]):
+            with self.subTest(extra=extra):
+                with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
+                    self._parse("10.0.0.5", "--recon-exec", *extra)
+
+    def test_recon_exec_runs_suggestions_but_not_bundled_pathfinder(self):
+        canned = [{"tool": "whatever", "cmd": "echo hi", "output": "loot/x.txt"}]
+        discovery = {
+            "target": "127.0.0.1", "ip": "127.0.0.1", "hostname": "",
+            "extra": {}, "open_ports": [],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            loot_dir = str(Path(tmp) / "loot")
+            original_argv = sys.argv
+            sys.argv = [
+                "one-shot-enum.py", "127.0.0.1", "--recon-exec",
+                "--loot-dir", loot_dir, "--no-color",
+            ]
+            try:
+                with patch.object(ose, "nmap_installed", return_value=False), \
+                        patch.object(ose, "warn_stale_loot"), \
+                        patch.object(ose, "localhost_tcp_discovery_scan",
+                                     return_value=discovery), \
+                        patch.object(ose, "suggest_for_host", return_value=canned), \
+                        patch.object(ose, "run_suggestions",
+                                     return_value=None) as run_suggestions, \
+                        patch.object(ose, "run_pathfinder") as run_pathfinder, \
+                        redirect_stdout(io.StringIO()):
+                    ose.main()
+            finally:
+                sys.argv = original_argv
+
+        run_suggestions.assert_called_once()
+        # The whole point of --recon-exec: the bundled PathFinder is never run.
+        run_pathfinder.assert_not_called()
+        # Recon was executed into the loot dir chosen on the command line.
+        self.assertEqual(run_suggestions.call_args.args[1], loot_dir)
+
+
 class StaleLootTests(unittest.TestCase):
     def test_warns_only_for_unexpected_hosts(self):
         with tempfile.TemporaryDirectory() as d:

@@ -3990,6 +3990,14 @@ def parse_args() -> argparse.Namespace:
              "hand results to PathFinder. Full AI enumeration is already on by default.",
     )
     parser.add_argument(
+        "--recon-exec",
+        dest="recon_exec",
+        action="store_true",
+        help="Run the generated recon commands into the loot tree (under --loot-dir) "
+             "and stop. Like --pathfinder but without invoking the bundled PathFinder, "
+             "so a separately installed PathFinder can analyse the loot afterwards.",
+    )
+    parser.add_argument(
         "--power",
         action="store_true",
         help="With --pathfinder-suggest/--pathfinder, add heavier web checks: nuclei.",
@@ -4115,6 +4123,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max-vulns must be >= 0.")
     if args.pathfinder_suggest and args.pathfinder:
         parser.error("Use either --pathfinder-suggest or --pathfinder, not both.")
+    if args.recon_exec and args.pathfinder_suggest:
+        parser.error("Use either --recon-exec or --pathfinder-suggest, not both.")
+    if args.recon_exec and args.pathfinder:
+        parser.error("Use either --recon-exec or --pathfinder, not both.")
     if (args.report_redact_secrets or args.report_include_secrets) and not args.report:
         parser.error("report secret-policy flags require --report.")
     if args.report_redact_secrets and args.report_include_secrets:
@@ -4162,6 +4174,13 @@ def parse_args() -> argparse.Namespace:
         normalized = {target.strip().lower() for target in args.targets}
         if len(normalized) > 1:
             parser.error("When using localhost, run it by itself as the target.")
+    # --recon-exec reuses the full --pathfinder recon pipeline (suggestion
+    # generation + run_suggestions into the loot tree); the decision block then
+    # returns before the bundled PathFinder call. Enable it only after the
+    # validation above so PathFinder-only flags are still rejected for a bare
+    # --recon-exec run (they would have no effect without a PathFinder handoff).
+    if args.recon_exec:
+        args.pathfinder = True
     return args
 
 
@@ -4474,6 +4493,12 @@ def main() -> None:
             warn("--pathfinder: no recon-tool suggestions generated from discovered services; continuing to PathFinder.")
         if run_result and run_result.get("interrupted"):
             warn("--pathfinder interrupted: skipping PathFinder analysis of partial recon loot.")
+            return
+        if args.recon_exec:
+            # --recon-exec stops after writing recon output into the loot tree; a
+            # separately installed PathFinder analyses LOOT_DIR afterwards.
+            good(f"Recon output written under {LOOT_DIR}/. "
+                 f"Next: `{PATHFINDER_SCAN_CMD} {LOOT_DIR}/`")
             return
         # Always analyse with PathFinder; --pathfinder may have produced AI surface loot
         # even when no extra recon tools were runnable.
