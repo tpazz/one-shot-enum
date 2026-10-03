@@ -3019,7 +3019,10 @@ def _web_suggestions(host: str, service: Service, loot: str, wordlist: str,
                     f"whatweb -a3 {_bash_arg(base)} --log-json={_lootpath(loot, f'whatweb_{port}.json')}", "whatweb_json",
                     output_file=_lootfile(loot, f"whatweb_{port}.json")),
         _suggestion(host, group, "ffuf",
-                    f"ffuf -u {_bash_arg(base + '/FUZZ')} -w {wl}{k} -maxtime {_bash_arg(DEFAULT_FFUF_MAXTIME)} "
+                    # -ac (auto-calibration) learns the baseline response and filters it,
+                    # so a CDN/WAF edge that answers 200 for every path (e.g. Cloudflare)
+                    # yields ~zero matches instead of flooding -od with bogus page dumps.
+                    f"ffuf -u {_bash_arg(base + '/FUZZ')} -w {wl}{k} -ac -maxtime {_bash_arg(DEFAULT_FFUF_MAXTIME)} "
                     f"-of json -o {_lootpath(loot, f'ffuf_{port}.json')} "
                     f"-od {_lootpath(loot, f'ffuf_pages_{scheme}_{port}')}",
                     "ffuf_json", output_file=_lootfile(loot, f"ffuf_{port}.json")),
@@ -3034,7 +3037,9 @@ def _web_suggestions(host: str, service: Service, loot: str, wordlist: str,
                         output_file=_lootfile(loot, f"nuclei_{port}.jsonl")),
             _suggestion(
                 host, group, "ffuf-recursive",
-                f"ffuf -u {_bash_arg(base + '/FUZZ')} -w {wl}{k} "
+                # -ac so recursion is driven by real matches, not a WAF/CDN baseline
+                # (otherwise every uniform 200 spawns a recursive branch).
+                f"ffuf -u {_bash_arg(base + '/FUZZ')} -w {wl}{k} -ac "
                 f"-recursion -recursion-depth {_bash_arg(DEFAULT_RECURSIVE_FFUF_DEPTH)} "
                 f"-recursion-strategy default -rate {_bash_arg(DEFAULT_RECURSIVE_FFUF_RATE)} "
                 f"-maxtime {_bash_arg(DEFAULT_RECURSIVE_FFUF_MAXTIME)} "

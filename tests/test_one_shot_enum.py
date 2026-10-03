@@ -346,6 +346,9 @@ class GeneratedCommandTests(unittest.TestCase):
         self.assertNotIn("sqlmap", cmds)
         self.assertIn(f"-maxtime {ose.DEFAULT_FFUF_MAXTIME}", cmds["ffuf"])
         self.assertIn("-od loot/10.0.0.5/ffuf_pages_http_80", cmds["ffuf"])
+        # -ac auto-calibration stops a CDN/WAF edge (uniform 200s) from matching
+        # every wordlist entry and flooding the -od dump / the job log.
+        self.assertIn("-ac", cmds["ffuf"])
 
     def test_every_runnable_suggestion_declares_its_output_file(self):
         services = [
@@ -383,6 +386,7 @@ class GeneratedCommandTests(unittest.TestCase):
         self.assertIn(f"-maxtime {ose.DEFAULT_RECURSIVE_FFUF_MAXTIME}", recursive)
         self.assertIn(f"-maxtime-job {ose.DEFAULT_RECURSIVE_FFUF_MAXTIME_JOB}", recursive)
         self.assertIn("ffuf_recursive_pages_http_80", recursive)
+        self.assertIn("-ac", recursive)
         self.assertNotIn("sqlmap", cmds)
 
     def test_power_adds_bounded_vhost_discovery_for_inferred_domain(self):
