@@ -1321,5 +1321,113 @@ class GenericOpenApiLootTests(unittest.TestCase):
             self.assertTrue(any(item["name"] == "ssrf:callback_url" for item in findings))
 
 
+class CdnDetectionTests(unittest.TestCase):
+    def test_cloudflare_edge_ip_detected_by_range(self):
+        # The IP whatweknow.today resolved to, with no port hint needed.
+        self.assertEqual(ose.detect_cdn("104.21.88.5"), "Cloudflare")
+
+    def test_non_cdn_ip_with_ordinary_ports_is_none(self):
+        self.assertIsNone(ose.detect_cdn("10.10.10.10", [22, 80, 443]))
+
+    def test_port_signature_detects_cdn_when_ip_not_in_list(self):
+        # An edge whose exact IP isn't baked in is still caught by the proxy-port
+        # signature being fully present.
+        self.assertEqual(
+            ose.detect_cdn("203.0.113.9", sorted(ose.CLOUDFLARE_PROXY_PORTS)),
+            "Cloudflare",
+        )
+
+    def test_real_log_port_set_detected_by_signature_on_out_of_range_ip(self):
+        # The exact open-port set from the field log (note: no 2095), on an IP not
+        # in the baked-in ranges — the distinctive-port count still flags Cloudflare.
+        ports = [80, 443, 2000, 2052, 2053, 2082, 2083, 2086, 2087, 2096, 5060,
+                 8020, 8080, 8443, 8880]
+        self.assertEqual(ose.detect_cdn("203.0.113.9", ports), "Cloudflare")
+
+    def test_invalid_ip_without_signature_is_none(self):
+        self.assertIsNone(ose.detect_cdn("not-an-ip", [80, 443]))
+
+
+class FallbackServicesTests(unittest.TestCase):
+    def test_web_ports_become_http_and_https_services(self):
+        # The Cloudflare port set from the failing scan, plus a non-web port.
+        svcs = ose.fallback_services_from_ports([80, 443, 2053, 8080, 8443, 5060])
+        by_port = {s["port"]: s for s in svcs}
+        self.assertEqual(by_port["80"]["service"], "http")
+        self.assertEqual(by_port["443"]["service"], "https")
+        self.assertEqual(by_port["2053"]["service"], "https")   # Cloudflare HTTPS port
+        self.assertEqual(by_port["8080"]["service"], "http")
+        self.assertEqual(by_port["8443"]["service"], "https")
+        # HTTPS ports carry the ssl tunnel so downstream treats them as TLS web.
+        self.assertEqual(by_port["443"]["tunnel"], "ssl")
+        self.assertEqual(by_port["2053"]["tunnel"], "ssl")
+        self.assertNotEqual(by_port["5060"]["service"], "http")  # non-web port isn't forced to http
+
+    def test_fallback_services_are_flagged_unverified_and_fire_web_recon(self):
+        svcs = ose.fallback_services_from_ports([80, 443])
+        self.assertTrue(all("unverified" in s["extrainfo"] for s in svcs))
+        self.assertTrue(all(s["protocol"] == "tcp" for s in svcs))
+        # The point of the fallback: these still read as web services, so the L7
+        # recon (whatweb/nikto/ffuf) and AI-surface loot fire on them.
+        self.assertTrue(all(ose.is_http_like_service(s) for s in svcs))
+
+    def test_dedupes_and_sorts_ports(self):
+        svcs = ose.fallback_services_from_ports([443, 80, 80])
+        self.assertEqual([s["port"] for s in svcs], ["80", "443"])
+
+
+class CdnEdgeCollapseTests(unittest.TestCase):
+    def test_cdn_edge_services_keeps_web_ports_only(self):
+        # Real Cloudflare port set + two non-web edge ports (2000, 5060).
+        svcs = ose.cdn_edge_services([80, 443, 2000, 2053, 5060, 8443, 8880])
+        by = {s["port"]: s for s in svcs}
+        self.assertEqual(by["80"]["service"], "http")
+        self.assertEqual(by["443"]["service"], "https")
+        self.assertEqual(by["2053"]["service"], "https")   # Cloudflare HTTPS port
+        self.assertEqual(by["2053"]["tunnel"], "ssl")
+        self.assertEqual(by["8880"]["service"], "http")    # Cloudflare HTTP port
+        self.assertNotIn("2000", by)                        # non-web edge artefacts dropped
+        self.assertNotIn("5060", by)
+
+    def _cf_scan_xml(self):
+        # A service-scan XML like nmap produces against a Cloudflare edge: web ports
+        # plus junk IANA-named proxy ports with bogus product/version.
+        return (
+            '<?xml version="1.0"?><nmaprun scanner="nmap"><host>'
+            '<address addr="104.21.88.5" addrtype="ipv4"/><ports>'
+            '<port protocol="tcp" portid="80"><state state="open"/><service name="http"/></port>'
+            '<port protocol="tcp" portid="443"><state state="open"/><service name="https" tunnel="ssl"/></port>'
+            '<port protocol="tcp" portid="2000"><state state="open"/><service name="cisco-sccp" product="x" version="1"/></port>'
+            '<port protocol="tcp" portid="2053"><state state="open"/><service name="knetd" product="x"/></port>'
+            '<port protocol="tcp" portid="5060"><state state="open"/><service name="sip"/></port>'
+            '<port protocol="tcp" portid="8443"><state state="open"/><service name="https-alt" product="x" version="9"/></port>'
+            '</ports></host></nmaprun>'
+        )
+
+    def test_rewrite_collapses_junk_ports_in_xml(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "nmap.xml"
+            p.write_text(self._cf_scan_xml(), encoding="utf-8")
+            ose._rewrite_cdn_service_xml(p)
+            root = ose.ET.parse(p).getroot()
+            ports = {pe.attrib["portid"]: pe.find("service") for pe in root.iter("port")}
+            # Non-web edge ports are removed entirely.
+            self.assertNotIn("2000", ports)
+            self.assertNotIn("5060", ports)
+            # Web ports kept and relabelled; bogus product/version stripped.
+            self.assertEqual(ports["2053"].attrib["name"], "https")
+            self.assertEqual(ports["2053"].attrib.get("tunnel"), "ssl")
+            self.assertEqual(ports["8443"].attrib["name"], "https")
+            self.assertEqual(ports["80"].attrib["name"], "http")
+            self.assertTrue(all("product" not in s.attrib for s in ports.values()))
+
+    def test_rewrite_is_safe_on_unparseable_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "bad.xml"
+            p.write_text("not xml at all", encoding="utf-8")
+            ose._rewrite_cdn_service_xml(p)  # must not raise
+            self.assertEqual(p.read_text(encoding="utf-8"), "not xml at all")
+
+
 if __name__ == "__main__":
     unittest.main()

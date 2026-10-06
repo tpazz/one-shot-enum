@@ -2446,7 +2446,8 @@ def tcp_discovery_scan(target: str,
 
 
 def tcp_service_scan(target: str, ports: List[int], outdir: Optional[Path],
-                     loot_xml_dir: Optional[Path] = None) -> Dict:
+                     loot_xml_dir: Optional[Path] = None,
+                     cdn: Optional[str] = None) -> Dict:
     with tempfile.TemporaryDirectory(prefix="nmapwrap_") as tmpdir:
         xml_path = Path(tmpdir) / "tcp_services.xml"
         port_str = ",".join(str(p) for p in ports)
@@ -2468,6 +2469,13 @@ def tcp_service_scan(target: str, ports: List[int], outdir: Optional[Path],
 
         if rc not in (0, 1):
             raise RuntimeError(f"nmap TCP service scan failed for {target}")
+
+        # On a CDN edge the proxy ports can't be fingerprinted (nmap reports IANA
+        # port-name guesses). Collapse them to a clean http/https surface in the XML
+        # *before* it is copied to loot and parsed, so PathFinder — which reads this
+        # file — doesn't synthesise a wall of bogus 'unhandled service' candidates.
+        if cdn:
+            _rewrite_cdn_service_xml(xml_path)
 
         if outdir:
             shutil.copy2(xml_path, outdir / "tcp_services.xml")
@@ -2698,6 +2706,161 @@ WEB_PORTS = {80, 443, 591, 3000, 5000, 8000, 8008, 8080, 8081, 8088, 8180,
              8443, 8444, 8800, 8888, 9000, 9090, 9443}
 WEB_HTTPS_PORTS = {443, 8443, 8444, 9443, 2083, 2087, 2096}
 SMB_PORTS = {139, 445}
+
+# --- CDN / WAF edge detection -------------------------------------------------
+# A hostname behind a CDN resolves to the CDN's edge, so a port scan hits the
+# edge proxy, not the origin: the "open" ports are the CDN's, identical on every
+# site it fronts, and a service/version scan against them typically can't complete
+# (the edge speaks TLS+SNI/HTTP at L7 and drops raw -sV/-sC probes). We flag this
+# so the failure is explained, and so recon degrades to the L7/web path instead of
+# collapsing the whole host. Small, high-signal subset of each CDN's ranges.
+CDN_IPV4_RANGES = {
+    "Cloudflare": [
+        "104.16.0.0/13", "172.64.0.0/13", "162.158.0.0/15", "198.41.128.0/17",
+        "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+        "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
+        "197.234.240.0/22", "131.0.72.0/22",
+    ],
+}
+# Cloudflare's standard HTTP/HTTPS proxy ports: a connect scan to any Cloudflare
+# edge shows this set "open" regardless of the origin's real services.
+CLOUDFLARE_HTTP_PORTS = {80, 2052, 2082, 2086, 2095, 8080, 8880}
+CLOUDFLARE_HTTPS_PORTS = {443, 2053, 2083, 2087, 2096, 8443}
+CLOUDFLARE_PROXY_PORTS = CLOUDFLARE_HTTP_PORTS | CLOUDFLARE_HTTPS_PORTS
+# The unusual (non-80/443/8080/8443) Cloudflare ports — seeing several of these
+# open together is a strong Cloudflare tell even if a scan misses one or two.
+CLOUDFLARE_SIGNATURE_PORTS = {2052, 2053, 2082, 2083, 2086, 2087, 2095, 2096, 8880}
+
+
+def detect_cdn(ip_addr: str, open_ports: Optional[List[int]] = None) -> Optional[str]:
+    """Return the CDN/WAF name if the target is being scanned at a known CDN edge.
+
+    Primary signal: the resolved IP falls in a baked-in CDN range. Secondary
+    (weaker) signal: the open-port set is a superset of a CDN's proxy signature,
+    which catches edges whose exact IP isn't in the small list above.
+    """
+    try:
+        addr = ipaddress.ip_address(ip_addr)
+    except ValueError:
+        addr = None
+    if addr is not None:
+        for name, cidrs in CDN_IPV4_RANGES.items():
+            for cidr in cidrs:
+                try:
+                    if addr in ipaddress.ip_network(cidr):
+                        return name
+                except ValueError:
+                    continue
+    if open_ports and len(CLOUDFLARE_SIGNATURE_PORTS & set(open_ports)) >= 4:
+        return "Cloudflare"
+    return None
+
+
+def fallback_services_from_ports(ports: List[int]) -> List[Service]:
+    """Minimal, clearly-unverified services synthesised from discovered open TCP
+    ports when the nmap service/version scan could not complete.
+
+    Discovery already proved these ports open, so rather than let a failed service
+    scan collapse the host to zero (no web recon, nothing for PathFinder), we emit
+    a best-effort service per port — http/https on known web ports — flagged as
+    unverified so nothing downstream mistakes it for a confirmed banner.
+    """
+    services: List[Service] = []
+    for port in sorted(set(ports)):
+        is_https = port in WEB_HTTPS_PORTS or port in CLOUDFLARE_HTTPS_PORTS
+        is_web = (port in WEB_PORTS or port in CLOUDFLARE_PROXY_PORTS)
+        if is_web:
+            name = "https" if is_https else "http"
+        else:
+            name = localhost_service_name(port) or "unknown"
+        services.append({
+            "port": str(port),
+            "protocol": "tcp",
+            "service": name,
+            "product": "",
+            "version": "",
+            "extrainfo": "unverified: port open at discovery, service scan did not complete",
+            "tunnel": "ssl" if is_https else "",
+            "scripts": "",
+        })
+    return services
+
+
+def _cdn_port_kind(port: int) -> Optional[str]:
+    """'https' / 'http' for a web port, else None (a non-web CDN edge artefact)."""
+    if port in WEB_HTTPS_PORTS or port in CLOUDFLARE_HTTPS_PORTS:
+        return "https"
+    if port in WEB_PORTS or port in CLOUDFLARE_HTTP_PORTS:
+        return "http"
+    return None
+
+
+def cdn_edge_services(ports: List[int]) -> List[Service]:
+    """Collapse a CDN edge's open ports into clean http/https web services.
+
+    A CDN fronts one origin over many proxy ports; they are the same L7 door, not
+    distinct services, and nmap can't fingerprint them (it falls back to misleading
+    IANA port-name guesses like cisco-sccp/knetd/radsec). Keep only the web ports,
+    labelled http/https, and drop the non-web edge artefacts — so recon and
+    PathFinder see the real web surface instead of a wall of bogus services. Used
+    on the scan-failure path, where there is no XML to rewrite.
+    """
+    services: List[Service] = []
+    for port in sorted(set(ports)):
+        kind = _cdn_port_kind(port)
+        if kind is None:
+            continue
+        services.append({
+            "port": str(port),
+            "protocol": "tcp",
+            "service": kind,
+            "product": "",
+            "version": "",
+            "extrainfo": "CDN edge proxy port (not an origin service)",
+            "tunnel": "ssl" if kind == "https" else "",
+            "scripts": "",
+        })
+    return services
+
+
+def _rewrite_cdn_service_xml(xml_path) -> None:
+    """In place: collapse a CDN edge's ports in an nmap service-scan XML.
+
+    PathFinder parses this file, so without this it emits one 'unhandled service'
+    candidate per proxy port using nmap's bogus IANA name. Here each web port is
+    relabelled http/https (dropping the misleading name/product/version) and every
+    non-web edge port is removed, leaving the clean web surface. Best-effort: any
+    parse/write error leaves the original file untouched.
+    """
+    try:
+        tree = ET.parse(xml_path)
+    except (ET.ParseError, OSError):
+        return
+    root = tree.getroot()
+    for host_el in root.findall("host"):
+        ports_el = host_el.find("ports")
+        if ports_el is None:
+            continue
+        for port_el in list(ports_el.findall("port")):
+            try:
+                portid = int(port_el.attrib.get("portid", "0"))
+            except ValueError:
+                portid = 0
+            kind = _cdn_port_kind(portid)
+            if kind is None:
+                ports_el.remove(port_el)
+                continue
+            svc_el = port_el.find("service")
+            if svc_el is None:
+                svc_el = ET.SubElement(port_el, "service")
+            svc_el.set("name", kind)
+            svc_el.set("tunnel", "ssl" if kind == "https" else "")
+            for attr in ("product", "version", "extrainfo", "servicefp", "ostype"):
+                svc_el.attrib.pop(attr, None)
+    try:
+        tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+    except OSError:
+        pass
 LDAP_PORTS = {389, 636, 3268, 3269}
 KERBEROS_PORTS = {88}
 DNS_PORTS = {53}
@@ -4386,16 +4549,29 @@ def main() -> None:
             loot_xml_dir = Path(LOOT_DIR) / safe_name(loot_host)
 
         if tcp_open_ports:
+            cdn = detect_cdn(ip_addr, tcp_open_ports)
+            if cdn:
+                info(f"{target}: resolves to a {cdn} edge ({ip_addr}); the open TCP ports "
+                     f"are the {cdn} proxy surface, not origin services. For real L4 "
+                     f"results, scan the origin directly.")
             try:
                 tcp_result = (
                     localhost_tcp_service_scan(target, tcp_open_ports, host_dir)
                     if use_local_fallback
-                    else tcp_service_scan(target, tcp_open_ports, host_dir, loot_xml_dir=loot_xml_dir)
+                    else tcp_service_scan(target, tcp_open_ports, host_dir,
+                                          loot_xml_dir=loot_xml_dir, cdn=cdn)
                 )
                 ip_addr = tcp_result.get("ip", ip_addr)
                 hostname = tcp_result.get("hostname", hostname)
                 extra = merge_extra_info(extra, tcp_result.get("extra", {}))
                 tcp_services = tcp_result.get("services", [])
+                if cdn and tcp_services:
+                    # The scan "succeeded" but, behind a CDN, its per-port names are
+                    # IANA guesses; tcp_service_scan already collapsed them to the
+                    # http/https web surface (in the XML PathFinder reads too).
+                    info(f"{target}: {cdn} edge — normalised the proxy ports to "
+                         f"{len(tcp_services)} web service(s); nmap's per-port names "
+                         f"were IANA guesses, not real services.")
                 if llm_options:
                     try:
                         run_llm_enumeration(target, tcp_services, **llm_options)
@@ -4403,6 +4579,24 @@ def main() -> None:
                         err(f"{target}: LLM/API enum failed: {exc}")
             except Exception as exc:
                 err(f"{target}: TCP service scan failed: {exc}")
+                # A failed service scan must not collapse the host: discovery already
+                # proved these ports open. Fall back to synthesised services so the
+                # L7/web recon (and the loot it writes for PathFinder) still fires,
+                # instead of producing zero services and zero follow-up commands.
+                if cdn:
+                    tcp_services = cdn_edge_services(tcp_open_ports)
+                    warn(f"{target}: continuing with L7/web recon on the {cdn} edge "
+                         f"({len(tcp_services)} web service(s)); service/version "
+                         f"detection isn't possible through the proxy.")
+                else:
+                    tcp_services = fallback_services_from_ports(tcp_open_ports)
+                    warn(f"{target}: continuing with {len(tcp_services)} unverified "
+                         f"service(s) from discovered open ports so web recon can run.")
+                if llm_options:
+                    try:
+                        run_llm_enumeration(target, tcp_services, **llm_options)
+                    except Exception as exc2:
+                        err(f"{target}: LLM/API enum failed: {exc2}")
         else:
             warn(f"{target}: skipping TCP service scan because no TCP ports were discovered")
 
