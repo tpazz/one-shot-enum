@@ -1051,6 +1051,42 @@ class ReconExecModeTests(unittest.TestCase):
         # Recon was executed into the loot dir chosen on the command line.
         self.assertEqual(run_suggestions.call_args.args[1], loot_dir)
 
+    def test_ai_surface_writes_ai_loot_without_recon_or_pathfinder(self):
+        # --ai-surface captures AI-surface loot on a discovery-only (lightweight)
+        # scan: it writes the loot but runs no recon tools and no PathFinder, and
+        # does not generate recon-tool suggestions.
+        disc = {"target": "127.0.0.1", "ip": "127.0.0.1", "hostname": "",
+                "extra": {}, "open_ports": [80]}
+        svc = {"services": [make_service(port=80, service="http")],
+               "ip": "127.0.0.1", "hostname": "", "extra": {}}
+        with tempfile.TemporaryDirectory() as tmp:
+            loot_dir = str(Path(tmp) / "loot")
+            original_argv = sys.argv
+            sys.argv = [
+                "one-shot-enum.py", "127.0.0.1", "--save", "--outdir", loot_dir,
+                "--loot-dir", loot_dir, "--ai-surface", "--no-color",
+            ]
+            try:
+                with patch.object(ose, "nmap_installed", return_value=False), \
+                        patch.object(ose, "warn_stale_loot"), \
+                        patch.object(ose, "localhost_tcp_discovery_scan", return_value=disc), \
+                        patch.object(ose, "localhost_tcp_service_scan", return_value=svc), \
+                        patch.object(ose, "run_llm_enumeration"), \
+                        patch.object(ose, "write_llm_enum_loot",
+                                     return_value=f"{loot_dir}/ai.json") as write_llm, \
+                        patch.object(ose, "suggest_for_host", return_value=[]) as suggest, \
+                        patch.object(ose, "run_suggestions") as run_suggestions, \
+                        patch.object(ose, "run_pathfinder") as run_pathfinder, \
+                        redirect_stdout(io.StringIO()):
+                    ose.main()
+            finally:
+                sys.argv = original_argv
+
+        write_llm.assert_called()          # AI-surface loot captured
+        suggest.assert_not_called()        # but no recon-tool suggestions
+        run_suggestions.assert_not_called()
+        run_pathfinder.assert_not_called()
+
 
 class StaleLootTests(unittest.TestCase):
     def test_warns_only_for_unexpected_hosts(self):

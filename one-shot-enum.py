@@ -4003,6 +4003,14 @@ def parse_args() -> argparse.Namespace:
              "so a separately installed PathFinder can analyse the loot afterwards.",
     )
     parser.add_argument(
+        "--ai-surface",
+        dest="ai_surface",
+        action="store_true",
+        help="Write AI-surface loot (LLM/MCP/A2A endpoints) into the loot tree even "
+             "without a recon run, so a discovery-only scan still captures it for "
+             "PathFinder. Light HTTP-level evidence only; no follow-up tools are run.",
+    )
+    parser.add_argument(
         "--power",
         action="store_true",
         help="With --pathfinder-suggest/--pathfinder, add heavier web checks: nuclei.",
@@ -4408,18 +4416,21 @@ def main() -> None:
 
         print_host_summary(ip_addr, hostname, extra, tcp_services, udp_services)
 
+        # AI-surface loot (LLM/MCP/A2A) is light HTTP-level evidence, so it is
+        # captured for PathFinder whenever recon is run OR --ai-surface is set
+        # (discovery-only / lightweight). --llm-endpoint stays a quick terminal peek.
+        if (args.pathfinder_suggest or args.pathfinder or args.ai_surface) and not args.llm_endpoint:
+            for svc in tcp_services:
+                written_llm = write_llm_enum_loot(
+                    loot_host, svc, LOOT_DIR,
+                    discovery_command=shlex.join([sys.executable, *sys.argv]),
+                )
+                if written_llm:
+                    good(f"AI surfaces -> {written_llm}")
+
         if args.pathfinder_suggest or args.pathfinder:
-            # Full AI enumeration is handed to PathFinder-oriented loot for both
-            # planning and live runs. --llm-endpoint intentionally stays a quick
-            # terminal peek and does not write AI surface loot.
-            if not args.llm_endpoint:
-                for svc in tcp_services:
-                    written_llm = write_llm_enum_loot(
-                        loot_host, svc, LOOT_DIR,
-                        discovery_command=shlex.join([sys.executable, *sys.argv]),
-                    )
-                    if written_llm:
-                        good(f"AI surfaces -> {written_llm}")
+            # OpenAPI inventory and recon-tool suggestions belong to a recon run,
+            # not the lightweight AI-surface capture above.
             if args.power:
                 for svc in tcp_services:
                     written_openapi = write_openapi_enum_loot(
