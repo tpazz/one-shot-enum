@@ -167,6 +167,29 @@ class CatchAllBaselineTests(unittest.TestCase):
         with patch.object(ose, "http_request", return_value=not_found):
             self.assertEqual(ose._probe_catch_all_baseline("http://h"), set())
 
+    def test_auth_gate_with_varying_bodies_is_still_a_baseline(self):
+        # A 403 gate that echoes the requested path returns a different body length
+        # per path; keyed on status alone, it is still recognised as a catch-all.
+        gates = [
+            {"status": 403, "content_type": "text/html", "text": "Forbidden: /aaaa", "json": None},
+            {"status": 403, "content_type": "text/html", "text": "Forbidden: /bbbbbbbbbbbbbbbb", "json": None},
+            {"status": 403, "content_type": "text/html", "text": "Forbidden: /cc", "json": None},
+            {"status": 403, "content_type": "text/html", "text": "Forbidden: /dddddddd", "json": None},
+        ]
+        with patch.object(ose, "http_request", side_effect=gates):
+            baseline = ose._probe_catch_all_baseline("http://h")
+        self.assertTrue(baseline)
+        # A real probe that also 403s matches the gate and is excluded from inference.
+        self.assertIn(ose._response_fingerprint(gates[0]), baseline)
+
+    def test_distinct_2xx_pages_are_not_collapsed_into_a_gate(self):
+        # Two genuinely different 200 responses (different sizes) must NOT look like
+        # one catch-all, so a real API's endpoints are not suppressed.
+        a = {"status": 200, "content_type": "application/json", "text": "{}", "json": {}}
+        b = {"status": 200, "content_type": "application/json",
+             "text": "{" + "x" * 2000 + "}", "json": {"x": 1}}
+        self.assertNotEqual(ose._response_fingerprint(a), ose._response_fingerprint(b))
+
 
 class ProbeResponseInterestTests(unittest.TestCase):
     def test_accepts_400_and_422_for_custom_agents(self):

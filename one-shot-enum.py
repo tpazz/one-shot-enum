@@ -1603,7 +1603,14 @@ def _response_fingerprint(response: Dict[str, Any]) -> Optional[Tuple[Any, ...]]
     else:
         family = content_type or "none"
     body = response.get("text") or ""
-    return (status, family, len(body) // 256)
+    # A gate/error status (401/403/405/400/422) is defined by the status itself,
+    # not its body: an auth gate or WAF returns it for every path, often echoing
+    # the path so the body length varies. Keying those on status+family alone
+    # (sentinel bucket) lets the baseline recognise the gate even when bodies
+    # differ. A 2xx catch-all must still agree on size, so a real API's distinct
+    # 200 responses are never collapsed into one baseline fingerprint.
+    bucket = len(body) // 256 if 200 <= status < 300 else "gate"
+    return (status, family, bucket)
 
 
 def _probe_catch_all_baseline(base_url: str, tls_mode: str = "verify") -> Set[Tuple[Any, ...]]:
