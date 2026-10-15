@@ -4531,7 +4531,7 @@ def _llm_enum_options(args: argparse.Namespace, use_local_fallback: bool = False
 # Main
 # =========================
 
-def main() -> None:
+def main() -> int | None:
     global NMAP_SCAN_TIMEOUT
     args = parse_args()
     NMAP_SCAN_TIMEOUT = args.scan_timeout
@@ -4668,6 +4668,25 @@ def main() -> None:
                     "open_ports": [],
                     "error": str(exc),
                 }
+
+    # Discovery exceptions are per-host results, not success. If EVERY target
+    # failed discovery there is nothing to enumerate, so fail the process:
+    # the OMEGA wrapper reads a non-zero exit as enum_status=ERROR and skips
+    # PathFinder, instead of inferring a successful scan from a clean exit and
+    # synthesising a report from imported findings over a scan that never ran.
+    discovery_failures = {
+        t: stage1_results[t]["error"] for t in targets
+        if stage1_results.get(t, {}).get("error")
+    }
+    if discovery_failures and len(discovery_failures) == len(targets):
+        err(f"Enumeration failed: discovery raised an error for all {len(targets)} target(s); "
+            "no host could be scanned.")
+        for t, detail in discovery_failures.items():
+            err(f"  {t}: {detail}")
+        return 1
+    if discovery_failures:
+        warn(f"Discovery failed for {len(discovery_failures)}/{len(targets)} target(s); "
+             "continuing with the rest (the failures are recorded per host).")
 
     print()
     good("Starting targeted TCP service scans...")
@@ -4891,4 +4910,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

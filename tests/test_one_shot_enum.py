@@ -1160,6 +1160,39 @@ class ReconExecModeTests(unittest.TestCase):
         run_pathfinder.assert_not_called()
 
 
+class DiscoveryFailureExitTests(unittest.TestCase):
+    """A discovery failure for every target must fail the process, so the OMEGA
+    wrapper records enum_status=ERROR and skips PathFinder instead of treating a
+    clean exit as a successful scan."""
+
+    def _run(self, argv, discovery):
+        original_argv = sys.argv
+        sys.argv = argv
+        try:
+            with patch.object(ose, "nmap_installed", return_value=False), \
+                    patch.object(ose, "warn_stale_loot"), \
+                    patch.object(ose, "localhost_tcp_discovery_scan", side_effect=discovery), \
+                    redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                return ose.main()
+        finally:
+            sys.argv = original_argv
+
+    def test_all_targets_failing_discovery_returns_nonzero(self):
+        def boom(*a, **k):
+            raise RuntimeError("nmap crashed")
+        with tempfile.TemporaryDirectory() as tmp:
+            code = self._run(["one-shot-enum.py", "127.0.0.1", "--loot-dir",
+                              str(Path(tmp) / "loot"), "--no-color"], boom)
+        self.assertEqual(code, 1)
+
+    def test_successful_discovery_still_returns_zero(self):
+        disc = {"target": "127.0.0.1", "ip": "127.0.0.1", "hostname": "", "extra": {}, "open_ports": []}
+        with tempfile.TemporaryDirectory() as tmp:
+            code = self._run(["one-shot-enum.py", "127.0.0.1", "--loot-dir",
+                              str(Path(tmp) / "loot"), "--no-color"], lambda *a, **k: disc)
+        self.assertIn(code, (0, None))
+
+
 class StaleLootTests(unittest.TestCase):
     def test_warns_only_for_unexpected_hosts(self):
         with tempfile.TemporaryDirectory() as d:
