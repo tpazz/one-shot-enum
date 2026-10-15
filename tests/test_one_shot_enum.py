@@ -119,6 +119,55 @@ class AiSurfaceInferenceTests(unittest.TestCase):
         self.assertIn("object-store", self._surfaces(["/minio/health/live"]))
 
 
+class CatchAllBaselineTests(unittest.TestCase):
+    """A server that answers every path the same way (SPA shell, login gate, WAF
+    interstitial) must not fingerprint as a dozen AI services. Baseline-matching
+    probe hits are annotated and excluded from inference, never silently dropped."""
+
+    def _hit(self, path, baseline_match):
+        return {"path": path, "status": 200, "content_type": "text/html",
+                "preview": "", "json_preview_lines": [], "baseline_match": baseline_match}
+
+    def test_catch_all_hits_produce_no_surfaces(self):
+        # Every AI probe path "matched", but all are the catch-all page.
+        ai_paths = ["/v1/chat/completions", "/api/tags", "/api/2.0/mlflow/experiments/search",
+                    "/collections", "/api/sessions"]
+        llm_enum = {"endpoints": [], "probe_hits": [self._hit(p, True) for p in ai_paths]}
+        self.assertEqual(ose.infer_ai_surfaces(make_service(), llm_enum), [])
+
+    def test_genuine_hit_alongside_baseline_still_detected(self):
+        # One real endpoint (not baseline) among catch-all noise is still inferred.
+        llm_enum = {"endpoints": [], "probe_hits": [
+            self._hit("/index.html", True),
+            self._hit("/about", True),
+            self._hit("/api/tags", False),
+            self._hit("/api/chat", False),
+        ]}
+        keys = {s["key"] for s in ose.infer_ai_surfaces(make_service(), llm_enum)}
+        self.assertIn("ollama", keys)
+
+    def test_normalized_paths_exclude_baseline_hits(self):
+        llm_enum = {"endpoints": [], "probe_hits": [
+            self._hit("/v1/chat/completions", True),
+            self._hit("/api/tags", False),
+        ]}
+        self.assertEqual(ose._normalized_ai_paths(llm_enum), {"/api/tags"})
+
+    def test_baseline_detected_when_two_bogus_paths_agree(self):
+        same = {"status": 200, "content_type": "text/html", "text": "<html>gate</html>",
+                "json": None}
+        with patch.object(ose, "http_request", return_value=same):
+            baseline = ose._probe_catch_all_baseline("http://h")
+        self.assertTrue(baseline)
+        # A real probe response with the same shape is recognised as the baseline.
+        self.assertIn(ose._response_fingerprint(same), baseline)
+
+    def test_no_baseline_when_bogus_paths_404(self):
+        not_found = {"status": 404, "content_type": "text/html", "text": "nope", "json": None}
+        with patch.object(ose, "http_request", return_value=not_found):
+            self.assertEqual(ose._probe_catch_all_baseline("http://h"), set())
+
+
 class ProbeResponseInterestTests(unittest.TestCase):
     def test_accepts_400_and_422_for_custom_agents(self):
         # A GET on a body-required POST route (custom FastAPI/Starlette agents).
@@ -1346,6 +1395,29 @@ class CdnDetectionTests(unittest.TestCase):
 
     def test_invalid_ip_without_signature_is_none(self):
         self.assertIsNone(ose.detect_cdn("not-an-ip", [80, 443]))
+
+    def test_cloudflare_detected_by_cf_ray_header(self):
+        self.assertEqual(ose.detect_cdn("10.0.0.1", [80], headers={"CF-RAY": "abc-LHR"}), "Cloudflare")
+
+    def test_railway_detected_by_header_on_ordinary_ip(self):
+        # Railway has no baked-in IP range; the header is the only signal.
+        self.assertEqual(
+            ose.detect_cdn("10.0.0.1", [443], headers={"x-railway-request-id": "r-1"}),
+            "Railway",
+        )
+
+    def test_cloudfront_and_fastly_detected_by_via_and_served_by(self):
+        self.assertEqual(ose.detect_cdn_from_headers({"Via": "1.1 abc.cloudfront.net (CloudFront)"}), "CloudFront")
+        self.assertEqual(ose.detect_cdn_from_headers({"X-Served-By": "cache-lhr-egll1980"}), "Fastly")
+
+    def test_server_header_cloudflare(self):
+        self.assertEqual(ose.detect_cdn_from_headers({"Server": "cloudflare"}), "Cloudflare")
+
+    def test_ordinary_headers_are_not_a_cdn(self):
+        self.assertIsNone(ose.detect_cdn_from_headers({"Server": "nginx/1.25", "X-Powered-By": "Express"}))
+
+    def test_header_signal_wins_over_absent_ip_and_ports(self):
+        self.assertEqual(ose.detect_cdn("10.10.10.10", None, headers={"x-amz-cf-id": "xyz"}), "CloudFront")
 
 
 class FallbackServicesTests(unittest.TestCase):

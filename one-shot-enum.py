@@ -45,6 +45,7 @@ import os
 import platform
 import queue
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -1581,8 +1582,71 @@ def is_interesting_probe_response(response: Dict[str, Any]) -> bool:
     return 200 <= status < 400 or status in (400, 401, 403, 405, 422)
 
 
+def _response_fingerprint(response: Dict[str, Any]) -> Optional[Tuple[Any, ...]]:
+    """A coarse shape of a response used to recognise a catch-all/gate page.
+
+    Keyed on status, content-type family and a bucketed body length so that a
+    server answering every path with the same page (an SPA shell, a login gate, a
+    WAF/CDN interstitial) produces one repeated fingerprint. The length bucket is
+    deliberately wide so an echoed path (``Cannot GET /xyz``) does not shift it.
+    """
+    status = response.get("status")
+    if status is None:
+        return None
+    content_type = (response.get("content_type") or "").split(";")[0].strip().lower()
+    if response.get("json") is not None:
+        family = "json"
+    elif "html" in content_type:
+        family = "html"
+    elif content_type.startswith("text/"):
+        family = "text"
+    else:
+        family = content_type or "none"
+    body = response.get("text") or ""
+    return (status, family, len(body) // 256)
+
+
+def _probe_catch_all_baseline(base_url: str, tls_mode: str = "verify") -> Set[Tuple[Any, ...]]:
+    """Detect a server that returns an 'interesting' response for ANY path.
+
+    Requests a handful of random, almost-certainly-nonexistent paths. If two or
+    more answer the same interesting way, that shared fingerprint is the server's
+    catch-all baseline: a real endpoint behaves differently from a bogus one, so a
+    probe hit matching this baseline is the gate/SPA, not evidence of a service.
+    Random tokens stop a cache or WAF from special-casing a fixed bogus path.
+    """
+    bogus_paths = [
+        f"/{secrets.token_hex(8)}",
+        f"/{secrets.token_hex(6)}/{secrets.token_hex(4)}.json",
+        f"/.well-known/{secrets.token_hex(6)}",
+        f"/v1/{secrets.token_hex(6)}",
+    ]
+    tally: Dict[Tuple[Any, ...], int] = {}
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [
+            executor.submit(http_request, f"{base_url}{path}", timeout=PROBE_TIMEOUT_SECONDS, tls_mode=tls_mode)
+            for path in bogus_paths
+        ]
+        for future in as_completed(futures):
+            try:
+                response = future.result()
+            except Exception:
+                continue
+            if not is_interesting_probe_response(response):
+                continue
+            fingerprint = _response_fingerprint(response)
+            if fingerprint is not None:
+                tally[fingerprint] = tally.get(fingerprint, 0) + 1
+    return {fingerprint for fingerprint, count in tally.items() if count >= 2}
+
+
 def probe_llm_paths(base_url: str, tls_mode: str = "verify") -> List[Dict[str, Any]]:
     hits: List[Dict[str, Any]] = []
+
+    # A nonexistent-path baseline established first: any real probe hit whose shape
+    # matches it is the catch-all/gate, not a real endpoint. Hits are annotated,
+    # never dropped, so nothing is hidden; inference excludes the baseline ones.
+    baseline = _probe_catch_all_baseline(base_url, tls_mode=tls_mode)
 
     with ThreadPoolExecutor(max_workers=8) as executor:
         future_map = {
@@ -1620,6 +1684,7 @@ def probe_llm_paths(base_url: str, tls_mode: str = "verify") -> List[Dict[str, A
                 "preview": probe_response_preview(response),
                 "json_preview_lines": format_probe_json_preview(response),
                 "tls_unverified": bool(response.get("tls_unverified")),
+                "baseline_match": bool(baseline) and _response_fingerprint(response) in baseline,
             })
 
     return sorted(hits, key=lambda hit: hit["index"])
@@ -1783,6 +1848,11 @@ def _normalized_ai_paths(llm_enum: Dict[str, Any]) -> Set[str]:
         if path:
             paths.add(path or "/")
     for hit in llm_enum.get("probe_hits", []):
+        # A hit matching the catch-all baseline is the gate/SPA responding to
+        # everything, not a real endpoint - exclude it so a server that 200s (or
+        # 401/403s) every path does not fingerprint as a dozen AI services at once.
+        if hit.get("baseline_match"):
+            continue
         path = str(hit.get("path", "")).strip().lower().rstrip("/")
         if path:
             paths.add(path or "/")
@@ -1792,6 +1862,8 @@ def _normalized_ai_paths(llm_enum: Dict[str, Any]) -> Set[str]:
 def _ai_preview_text(llm_enum: Dict[str, Any]) -> str:
     chunks: List[str] = []
     for hit in llm_enum.get("probe_hits", []):
+        if hit.get("baseline_match"):
+            continue
         chunks.append(str(hit.get("preview", "")))
         chunks.extend(str(line) for line in hit.get("json_preview_lines", []))
     return " ".join(chunks).lower()
@@ -2732,13 +2804,53 @@ CLOUDFLARE_PROXY_PORTS = CLOUDFLARE_HTTP_PORTS | CLOUDFLARE_HTTPS_PORTS
 CLOUDFLARE_SIGNATURE_PORTS = {2052, 2053, 2082, 2083, 2086, 2087, 2095, 2096, 8880}
 
 
-def detect_cdn(ip_addr: str, open_ports: Optional[List[int]] = None) -> Optional[str]:
+# Response-header signatures for CDN/edge/PaaS providers. A header is the single
+# strongest attribution signal - it is emitted by the edge itself and does not
+# depend on a baked-in IP list that ages. Each entry maps a provider name to a
+# tuple of (header-name, substring-the-value-must-contain-or-"" for presence-only).
+CDN_HEADER_SIGNATURES = {
+    "Cloudflare": (("cf-ray", ""), ("cf-cache-status", ""), ("server", "cloudflare")),
+    "Railway": (("x-railway-request-id", ""), ("x-railway-edge", ""), ("server", "railway")),
+    "Fastly": (("x-served-by", "cache-"), ("x-fastly-request-id", ""), ("fastly-io-info", ""), ("via", "varnish")),
+    "Akamai": (("x-akamai-request-id", ""), ("server", "akamaighost"), ("x-akamai-transformed", "")),
+    "CloudFront": (("x-amz-cf-id", ""), ("x-amz-cf-pop", ""), ("via", "cloudfront")),
+    "Vercel": (("x-vercel-id", ""), ("server", "vercel")),
+    "Netlify": (("x-nf-request-id", ""), ("server", "netlify")),
+}
+
+
+def detect_cdn_from_headers(headers: Optional[Dict[str, str]]) -> Optional[str]:
+    """Return the CDN/edge/PaaS name implied by HTTP response headers, or None.
+
+    Header attribution does not age like an IP range and distinguishes providers
+    (Railway, Fastly, CloudFront, ...) that share no baked-in ranges here.
+    """
+    if not headers:
+        return None
+    lowered = {str(k).lower(): str(v).lower() for k, v in headers.items()}
+    for name, signatures in CDN_HEADER_SIGNATURES.items():
+        for header_name, needle in signatures:
+            value = lowered.get(header_name)
+            if value is None:
+                continue
+            if not needle or needle in value:
+                return name
+    return None
+
+
+def detect_cdn(ip_addr: str, open_ports: Optional[List[int]] = None,
+               headers: Optional[Dict[str, str]] = None) -> Optional[str]:
     """Return the CDN/WAF name if the target is being scanned at a known CDN edge.
 
-    Primary signal: the resolved IP falls in a baked-in CDN range. Secondary
-    (weaker) signal: the open-port set is a superset of a CDN's proxy signature,
-    which catches edges whose exact IP isn't in the small list above.
+    Signals, strongest first: (1) a response header the edge itself emits
+    (``cf-ray``, ``x-railway-request-id``, ``via: cloudfront`` ...), which also
+    names the specific provider; (2) the resolved IP falls in a baked-in CDN
+    range; (3) the open-port set is a superset of a CDN's proxy signature, which
+    catches edges whose exact IP isn't in the small list above.
     """
+    by_header = detect_cdn_from_headers(headers)
+    if by_header is not None:
+        return by_header
     try:
         addr = ipaddress.ip_address(ip_addr)
     except ValueError:
@@ -2753,6 +2865,30 @@ def detect_cdn(ip_addr: str, open_ports: Optional[List[int]] = None) -> Optional
                     continue
     if open_ports and len(CLOUDFLARE_SIGNATURE_PORTS & set(open_ports)) >= 4:
         return "Cloudflare"
+    return None
+
+
+def _probe_edge_headers(host: str, open_ports: List[int], tls_mode: str = "auto") -> Optional[Dict[str, str]]:
+    """Best-effort single HTTP request to read a host's edge/CDN response headers.
+
+    Tries one web port (HTTPS preferred) and returns the response headers so
+    detect_cdn can attribute edges (Railway, Fastly, CloudFront, ...) that have no
+    baked-in IP range here. Any failure returns None and callers fall back to the
+    IP/port signals - this never blocks or fails the scan.
+    """
+    if not host:
+        return None
+    candidates = ([(p, "https") for p in (443, 8443) if p in open_ports]
+                  + [(p, "http") for p in (80, 8080) if p in open_ports])
+    for port, scheme in candidates:
+        netloc = host if port in (80, 443) else f"{host}:{port}"
+        try:
+            response = http_request(f"{scheme}://{netloc}/", timeout=PROBE_TIMEOUT_SECONDS, tls_mode=tls_mode)
+        except Exception:
+            continue
+        headers = response.get("headers")
+        if headers:
+            return headers
     return None
 
 
@@ -4549,7 +4685,10 @@ def main() -> None:
             loot_xml_dir = Path(LOOT_DIR) / safe_name(loot_host)
 
         if tcp_open_ports:
-            cdn = detect_cdn(ip_addr, tcp_open_ports)
+            # Edge/CDN attribution only matters for remote targets; a local-fallback
+            # (localhost) scan is never behind a CDN, so skip the header probe there.
+            edge_headers = None if use_local_fallback else _probe_edge_headers(hostname or ip_addr, tcp_open_ports)
+            cdn = detect_cdn(ip_addr, tcp_open_ports, headers=edge_headers)
             if cdn:
                 info(f"{target}: resolves to a {cdn} edge ({ip_addr}); the open TCP ports "
                      f"are the {cdn} proxy surface, not origin services. For real L4 "
