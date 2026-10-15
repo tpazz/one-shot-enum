@@ -3131,10 +3131,14 @@ def warn_stale_loot(loot: str, targets: List[str]) -> None:
 
 
 def write_llm_enum_loot(host: str, service: Service, loot: str,
-                        discovery_command: str = "") -> Optional[Path]:
+                        discovery_command: str = "", cdn: Optional[str] = None) -> Optional[Path]:
     """Write a service's LLM/AI surface enumeration into the loot dir as a
     PathFinder-consumable JSON so PathFinder's AI/LLM rules can synthesise attack
-    paths from it. Returns the written path, or None if there's nothing to emit."""
+    paths from it. Returns the written path, or None if there's nothing to emit.
+
+    ``cdn`` names the edge/CDN provider when the host resolves to one, so
+    PathFinder can treat an AI surface seen at the edge as possibly-not-origin and
+    down-weight it rather than reporting it as a confirmed origin service."""
     llm_enum = service.get("llm_enum")
     # Hand off if we recognised a framework surface OR inferred an agent role
     # (custom agents often match no framework fingerprint but are clearly AI).
@@ -3150,6 +3154,7 @@ def write_llm_enum_loot(host: str, service: Service, loot: str,
         "discovery_command": discovery_command or None,
         "host": host,
         "port": port_int,
+        "cdn": cdn or None,
         "base_url": llm_enum.get("base_url"),
         "service": {
             "name": service.get("service", ""),
@@ -4676,6 +4681,7 @@ def main() -> None:
         extra: Dict[str, str] = s1.get("extra", {})
         tcp_services: List[Service] = []
         udp_services: List[Service] = []
+        cdn = None  # Set when the host resolves to a known CDN/edge; carried into loot.
 
         # Pin one host identity for this iteration so the loot subdir is consistent
         # across the nmap XML and every suggested tool output.
@@ -4757,6 +4763,7 @@ def main() -> None:
                 written_llm = write_llm_enum_loot(
                     loot_host, svc, LOOT_DIR,
                     discovery_command=shlex.join([sys.executable, *sys.argv]),
+                    cdn=cdn,
                 )
                 if written_llm:
                     good(f"AI surfaces -> {written_llm}")
