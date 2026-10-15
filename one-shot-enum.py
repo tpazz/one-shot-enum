@@ -4531,6 +4531,20 @@ def _llm_enum_options(args: argparse.Namespace, use_local_fallback: bool = False
 # Main
 # =========================
 
+def write_enumeration_status(outdir: Optional[Path], targets: List[str], errors: Dict[str, str]) -> Dict:
+    """Persist coverage independently of findings so partial scans stay visible."""
+    failed = len(errors)
+    payload = {
+        "execution_status": "error" if failed == len(targets) else "partial" if failed else "completed",
+        "errors": [f"{target}: {detail}" for target, detail in errors.items()],
+        "targets": [{"target": target, "status": "error" if target in errors else "completed",
+                     "error": errors.get(target)} for target in targets],
+    }
+    if outdir is not None:
+        write_text(outdir / "enum-status.json", json.dumps(payload, indent=2) + "\n")
+    return payload
+
+
 def main() -> int | None:
     global NMAP_SCAN_TIMEOUT
     args = parse_args()
@@ -4678,11 +4692,13 @@ def main() -> int | None:
         t: stage1_results[t]["error"] for t in targets
         if stage1_results.get(t, {}).get("error")
     }
+    host_errors = dict(discovery_failures)
     if discovery_failures and len(discovery_failures) == len(targets):
         err(f"Enumeration failed: discovery raised an error for all {len(targets)} target(s); "
             "no host could be scanned.")
         for t, detail in discovery_failures.items():
             err(f"  {t}: {detail}")
+        write_enumeration_status(base_outdir, targets, host_errors)
         return 1
     if discovery_failures:
         warn(f"Discovery failed for {len(discovery_failures)}/{len(targets)} target(s); "
@@ -4750,6 +4766,7 @@ def main() -> int | None:
                         err(f"{target}: LLM/API enum failed: {exc}")
             except Exception as exc:
                 err(f"{target}: TCP service scan failed: {exc}")
+                host_errors[target] = f"TCP service scan failed: {exc}"
                 # A failed service scan must not collapse the host: discovery already
                 # proved these ports open. Fall back to synthesised services so the
                 # L7/web recon (and the loot it writes for PathFinder) still fires,
@@ -4778,6 +4795,7 @@ def main() -> int | None:
                 udp_services = udp_result.get("udp_services", [])
             except Exception as exc:
                 err(f"{target}: UDP scan failed: {exc}")
+                host_errors[target] = f"UDP scan failed: {exc}"
 
         print_host_summary(ip_addr, hostname, extra, tcp_services, udp_services)
 
@@ -4845,6 +4863,7 @@ def main() -> int | None:
                 "banner": service_banner(svc),
             })
 
+    write_enumeration_status(base_outdir, targets, host_errors)
     if args.save and base_outdir:
         csv_path = base_outdir / "services_summary.csv"
         write_csv_summary(csv_path, csv_rows)
@@ -4881,7 +4900,7 @@ def main() -> int | None:
             # separately installed PathFinder analyses LOOT_DIR afterwards.
             good(f"Recon output written under {LOOT_DIR}/. "
                  f"Next: `{PATHFINDER_SCAN_CMD} {LOOT_DIR}/`")
-            return
+            return 2 if host_errors else None
         # Always analyse with PathFinder; --pathfinder may have produced AI surface loot
         # even when no extra recon tools were runnable.
         pathfinder_path = str(Path(__file__).resolve().parent.parent / "PathFinder")
@@ -4907,6 +4926,8 @@ def main() -> int | None:
             no_color=args.no_color,
             oscp=args.oscp,
         )
+    # Exit 2 means usable loot plus incomplete host coverage; do not lose either.
+    return 2 if host_errors else None
 
 
 if __name__ == "__main__":
