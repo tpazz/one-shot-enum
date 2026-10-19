@@ -4531,14 +4531,23 @@ def _llm_enum_options(args: argparse.Namespace, use_local_fallback: bool = False
 # Main
 # =========================
 
-def write_enumeration_status(outdir: Optional[Path], targets: List[str], errors: Dict[str, str]) -> Dict:
+def write_enumeration_status(outdir: Optional[Path], targets: List[str], errors: Dict[str, str],
+                             *, discovery_failures=None, recon=None) -> Dict:
     """Persist coverage independently of findings so partial scans stay visible."""
-    failed = len(errors)
+    discovery_failures = errors if discovery_failures is None else discovery_failures
+    details = [f"{target}: {detail}" for target, detail in errors.items()]
+    if recon:
+        gaps = [(label, recon.get(key, 0)) for key, label in (
+            ('nonzero', 'non-zero exits'), ('failed', 'failed'),
+            ('timed_out', 'timed out'), ('interrupted', 'interrupted')) if recon.get(key, 0)]
+        if gaps:
+            details.append('Follow-up recon incomplete: ' + ', '.join(f'{count} {label}' for label, count in gaps))
     payload = {
-        "execution_status": "error" if failed == len(targets) else "partial" if failed else "completed",
-        "errors": [f"{target}: {detail}" for target, detail in errors.items()],
-        "targets": [{"target": target, "status": "error" if target in errors else "completed",
+        "execution_status": "error" if targets and len(discovery_failures) == len(targets) else "partial" if details else "completed",
+        "errors": details,
+        "targets": [{"target": target, "status": "error" if target in discovery_failures else "partial" if target in errors else "completed",
                      "error": errors.get(target)} for target in targets],
+        "recon": recon,
     }
     if outdir is not None:
         write_text(outdir / "enum-status.json", json.dumps(payload, indent=2) + "\n")
@@ -4863,7 +4872,7 @@ def main() -> int | None:
                 "banner": service_banner(svc),
             })
 
-    write_enumeration_status(base_outdir, targets, host_errors)
+    coverage = write_enumeration_status(base_outdir, targets, host_errors, discovery_failures=discovery_failures)
     if args.save and base_outdir:
         csv_path = base_outdir / "services_summary.csv"
         write_csv_summary(csv_path, csv_rows)
@@ -4892,15 +4901,17 @@ def main() -> int | None:
             )
         else:
             warn("--pathfinder: no recon-tool suggestions generated from discovered services; continuing to PathFinder.")
+        coverage = write_enumeration_status(base_outdir, targets, host_errors,
+                                            discovery_failures=discovery_failures, recon=run_result)
         if run_result and run_result.get("interrupted"):
             warn("--pathfinder interrupted: skipping PathFinder analysis of partial recon loot.")
-            return
+            return 2
         if args.recon_exec:
             # --recon-exec stops after writing recon output into the loot tree; a
             # separately installed PathFinder analyses LOOT_DIR afterwards.
             good(f"Recon output written under {LOOT_DIR}/. "
                  f"Next: `{PATHFINDER_SCAN_CMD} {LOOT_DIR}/`")
-            return 2 if host_errors else None
+            return 2 if coverage['execution_status'] == 'partial' else None
         # Always analyse with PathFinder; --pathfinder may have produced AI surface loot
         # even when no extra recon tools were runnable.
         pathfinder_path = str(Path(__file__).resolve().parent.parent / "PathFinder")
@@ -4927,7 +4938,7 @@ def main() -> int | None:
             oscp=args.oscp,
         )
     # Exit 2 means usable loot plus incomplete host coverage; do not lose either.
-    return 2 if host_errors else None
+    return 2 if coverage['execution_status'] == 'partial' else None
 
 
 if __name__ == "__main__":
