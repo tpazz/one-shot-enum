@@ -39,6 +39,7 @@ Features:
 
 import argparse
 import csv
+import hashlib
 import ipaddress
 import json
 import os
@@ -1045,7 +1046,7 @@ def infer_agent_profile(llm_enum: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(ep, dict) and ep.get("path"):
             paths.add(str(ep["path"]).lower())
     for hit in llm_enum.get("probe_hits", []):
-        if isinstance(hit, dict) and hit.get("path"):
+        if isinstance(hit, dict) and hit.get("path") and not hit.get("baseline_match"):
             paths.add(str(hit["path"]).lower())
     if not paths:
         return {}
@@ -1582,13 +1583,11 @@ def is_interesting_probe_response(response: Dict[str, Any]) -> bool:
     return 200 <= status < 400 or status in (400, 401, 403, 405, 422)
 
 
-def _response_fingerprint(response: Dict[str, Any]) -> Optional[Tuple[Any, ...]]:
-    """A coarse shape of a response used to recognise a catch-all/gate page.
+def _response_fingerprint(response: Dict[str, Any], request_path: str = '') -> Optional[Tuple[Any, ...]]:
+    """Recognise a repeated gate without equating unrelated same-size bodies.
 
-    Keyed on status, content-type family and a bucketed body length so that a
-    server answering every path with the same page (an SPA shell, a login gate, a
-    WAF/CDN interstitial) produces one repeated fingerprint. The length bucket is
-    deliberately wide so an echoed path (``Cannot GET /xyz``) does not shift it.
+    All responses use normalized content hashes. Known requested paths can be
+    normalized in non-success responses; status alone never identifies a gate.
     """
     status = response.get("status")
     if status is None:
@@ -1603,13 +1602,14 @@ def _response_fingerprint(response: Dict[str, Any]) -> Optional[Tuple[Any, ...]]
     else:
         family = content_type or "none"
     body = response.get("text") or ""
-    # A gate/error status (401/403/405/400/422) is defined by the status itself,
-    # not its body: an auth gate or WAF returns it for every path, often echoing
-    # the path so the body length varies. Keying those on status+family alone
-    # (sentinel bucket) lets the baseline recognise the gate even when bodies
-    # differ. A 2xx catch-all must still agree on size, so a real API's distinct
-    # 200 responses are never collapsed into one baseline fingerprint.
-    bucket = len(body) // 256 if 200 <= status < 300 else "gate"
+    # Equal length is not equal content. Keep genuine same-size API responses
+    # distinct; a catch-all must agree on its normalized response body.
+    normalized = json.dumps(response['json'], sort_keys=True, separators=(',', ':')) if response.get('json') is not None else re.sub(r'\s+', ' ', body).strip()
+    if not 200 <= status < 300:
+        if request_path:
+            normalized = normalized.replace(request_path, '[requested path]')
+        normalized = re.sub(r'(?i)(Forbidden:\s*)/[^\s<>"\']+', r'\1[requested path]', normalized)
+    bucket = hashlib.sha256(normalized.encode('utf-8')).hexdigest()
     return (status, family, bucket)
 
 
@@ -1630,10 +1630,10 @@ def _probe_catch_all_baseline(base_url: str, tls_mode: str = "verify") -> Set[Tu
     ]
     tally: Dict[Tuple[Any, ...], int] = {}
     with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = [
-            executor.submit(http_request, f"{base_url}{path}", timeout=PROBE_TIMEOUT_SECONDS, tls_mode=tls_mode)
+        futures = {
+            executor.submit(http_request, f"{base_url}{path}", timeout=PROBE_TIMEOUT_SECONDS, tls_mode=tls_mode): path
             for path in bogus_paths
-        ]
+        }
         for future in as_completed(futures):
             try:
                 response = future.result()
@@ -1641,7 +1641,7 @@ def _probe_catch_all_baseline(base_url: str, tls_mode: str = "verify") -> Set[Tu
                 continue
             if not is_interesting_probe_response(response):
                 continue
-            fingerprint = _response_fingerprint(response)
+            fingerprint = _response_fingerprint(response, futures[future])
             if fingerprint is not None:
                 tally[fingerprint] = tally.get(fingerprint, 0) + 1
     return {fingerprint for fingerprint, count in tally.items() if count >= 2}
@@ -1691,10 +1691,32 @@ def probe_llm_paths(base_url: str, tls_mode: str = "verify") -> List[Dict[str, A
                 "preview": probe_response_preview(response),
                 "json_preview_lines": format_probe_json_preview(response),
                 "tls_unverified": bool(response.get("tls_unverified")),
-                "baseline_match": bool(baseline) and _response_fingerprint(response) in baseline,
+                "baseline_match": bool(baseline) and _response_fingerprint(response, path) in baseline,
+                "protocol_verified": _probe_protocol_verified(path, response),
+                "response_fingerprint": list(_response_fingerprint(response, path) or ()),
             })
 
     return sorted(hits, key=lambda hit: hit["index"])
+
+
+def _probe_protocol_verified(path: str, response: Dict[str, Any]) -> bool:
+    """Only read-only protocol-shaped JSON corroborates a route name.
+
+    Unknown shapes remain inventory/validation leads, never silently discarded.
+    """
+    data = response.get('json')
+    if not isinstance(data, dict) or not 200 <= (response.get('status') or 0) < 300:
+        return False
+    path = path.lower().rstrip('/')
+    if 'mlflow' in path:
+        return any(isinstance(data.get(k), list) for k in ('experiments', 'registered_models', 'model_versions'))
+    if 'agent' in path or path == '/a2a':
+        return isinstance(data.get('name'), str) and bool(data.get('url') or data.get('supportedInterfaces')) and isinstance(data.get('capabilities'), dict)
+    if path.endswith('/models') or path == '/api/tags':
+        return isinstance(data.get('models'), list) or data.get('object') == 'list' and isinstance(data.get('data'), list)
+    if path == '/mcp':
+        return data.get('jsonrpc') == '2.0' and isinstance(data.get('result'), dict)
+    return False
 
 
 def _resolve_openapi_local_ref(openapi_doc: Dict[str, Any], value: Any,
@@ -2198,7 +2220,7 @@ def enumerate_llm_service(target: str,
     # inventory / agent-card list. Still read-only (initialize + tools/list, GET
     # agent cards); enabled by the default full AI enumeration mode.
     if active:
-        probe_paths = {str(hit.get("path", "")).lower() for hit in result["probe_hits"]}
+        probe_paths = {str(hit.get("path", "")).lower() for hit in result["probe_hits"] if not hit.get('baseline_match')}
         if architecture == "tool-server" or "agent-mcp" in surface_keys \
                 or any(p in probe_paths for p in ("/mcp", "/mcp/", "/sse")):
             result["mcp_tools"] = enumerate_mcp_tools(base_url, tls_mode=effective_tls_mode)
@@ -2222,7 +2244,7 @@ def enumerate_llm_service(target: str,
     )
     if not chat_path:
         chat_path = next(
-            (hit["path"] for hit in result["probe_hits"] if _is_chat_endpoint(hit.get("path", ""))),
+            (hit["path"] for hit in result["probe_hits"] if not hit.get('baseline_match') and _is_chat_endpoint(hit.get("path", ""))),
             "",
         )
     result["chat_path"] = chat_path
@@ -3149,7 +3171,7 @@ def write_llm_enum_loot(host: str, service: Service, loot: str,
     llm_enum = service.get("llm_enum")
     # Hand off if we recognised a framework surface OR inferred an agent role
     # (custom agents often match no framework fingerprint but are clearly AI).
-    if not isinstance(llm_enum, dict) or not (llm_enum.get("ai_surfaces") or llm_enum.get("agent_profile")):
+    if not isinstance(llm_enum, dict) or not (llm_enum.get("ai_surfaces") or llm_enum.get("agent_profile") or llm_enum.get('probe_hits')):
         return None
     try:
         port_int = int(service.get("port"))
@@ -3181,6 +3203,9 @@ def write_llm_enum_loot(host: str, service: Service, loot: str,
                 "content_type": hit.get("content_type", ""),
                 "preview": hit.get("preview", ""),
                 "json_preview_lines": hit.get("json_preview_lines", []),
+                "baseline_match": bool(hit.get("baseline_match")),
+                "protocol_verified": bool(hit.get("protocol_verified")),
+                "response_fingerprint": hit.get("response_fingerprint"),
             }
             for hit in llm_enum.get("probe_hits", []) if isinstance(hit, dict)
         ],

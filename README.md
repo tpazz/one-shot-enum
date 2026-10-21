@@ -4,6 +4,12 @@ Fast first-pass enumeration around Nmap, with bounded target expansion,
 service fingerprinting, read-only AI surface checks, and optional PathFinder
 handoff.
 
+Catch-all detection compares normalized response content, including error
+responses, rather than treating equal lengths or statuses as equal services.
+Baseline flags, protocol corroboration and fingerprints survive the PathFinder
+handoff. Baseline-only probes remain in raw loot without implying an AI service
+or routing active confirmation from the gate-page match.
+
 ## Install and verify
 
 ### Supported environment

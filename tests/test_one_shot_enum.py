@@ -153,6 +153,20 @@ class CatchAllBaselineTests(unittest.TestCase):
         ]}
         self.assertEqual(ose._normalized_ai_paths(llm_enum), {"/api/tags"})
 
+    def test_agent_inference_also_excludes_baseline(self):
+        profile = ose.infer_agent_profile({'endpoints': [], 'probe_hits': [self._hit('/.well-known/agent.json', True), self._hit('/a2a', True)]})
+        self.assertFalse(profile.get('role'))
+
+    def test_same_size_genuine_json_is_not_a_baseline(self):
+        a = {'status': 200, 'content_type': 'application/json', 'text': '{"a":1}', 'json': {'a': 1}}
+        b = {'status': 200, 'content_type': 'application/json', 'text': '{"b":1}', 'json': {'b': 1}}
+        self.assertNotEqual(ose._response_fingerprint(a), ose._response_fingerprint(b))
+        self.assertFalse(ose._probe_protocol_verified('/api/2.0/mlflow/experiments/search', {'status': 200, 'json': None}))
+        self.assertTrue(ose._probe_protocol_verified('/api/2.0/mlflow/experiments/search', {'status': 200, 'json': {'experiments': []}}))
+        a.update(status=403, json={'error': 'generic gate'})
+        b.update(status=403, json={'error': 'MLflow token required'})
+        self.assertNotEqual(ose._response_fingerprint(a), ose._response_fingerprint(b))
+
     def test_baseline_detected_when_two_bogus_paths_agree(self):
         same = {"status": 200, "content_type": "text/html", "text": "<html>gate</html>",
                 "json": None}
@@ -1260,12 +1274,25 @@ class LlmEnumLootSchemaTests(unittest.TestCase):
             self.assertEqual(payload["host"], "10.0.0.5")
             self.assertEqual(payload["port"], 11434)
             self.assertTrue(payload["ai_surfaces"])
+            self.assertIn('baseline_match', payload['probe_hits'][0])
+            self.assertIn('protocol_verified', payload['probe_hits'][0])
 
     def test_returns_none_without_ai_signal(self):
         svc = {"port": 80, "service": "http", "product": "", "version": "", "extrainfo": "",
                "scripts": "", "llm_enum": {"base_url": "http://x", "ai_surfaces": [], "agent_profile": {}}}
         with tempfile.TemporaryDirectory() as d:
             self.assertIsNone(ose.write_llm_enum_loot("x", svc, d))
+
+    def test_baseline_only_probe_inventory_is_exported(self):
+        svc = self._service_with_surface()
+        svc['llm_enum'].update(ai_surfaces=[], agent_profile={}, endpoints=[], probe_hits=[{
+            'path': '/mcp', 'status': 200, 'baseline_match': True, 'protocol_verified': False}])
+        with tempfile.TemporaryDirectory() as d:
+            written = ose.write_llm_enum_loot('x', svc, d)
+            self.assertIsNotNone(written)
+            payload = json.loads(written.read_text(encoding='utf-8'))
+            self.assertTrue(payload['probe_hits'][0]['baseline_match'])
+            self.assertFalse(payload['ai_surfaces'])
 
     @unittest.skipUnless(_HAS_PATHFINDER, "PathFinder sibling repo not present")
     def test_pathfinder_parses_written_loot(self):
