@@ -1705,6 +1705,9 @@ def _probe_protocol_verified(path: str, response: Dict[str, Any]) -> bool:
     Unknown shapes remain inventory/validation leads, never silently discarded.
     """
     data = response.get('json')
+    path = path.lower().rstrip('/')
+    if path in ('/api/kernels', '/api/sessions'):
+        return 200 <= (response.get('status') or 0) < 300 and isinstance(data, list) and all(isinstance(item, dict) and item.get('id') for item in data)
     if not isinstance(data, dict) or not 200 <= (response.get('status') or 0) < 300:
         return False
     path = path.lower().rstrip('/')
@@ -2575,6 +2578,11 @@ def tcp_service_scan(target: str, ports: List[int], outdir: Optional[Path],
         # port-name guesses). Collapse them to a clean http/https surface in the XML
         # *before* it is copied to loot and parsed, so PathFinder — which reads this
         # file — doesn't synthesise a wall of bogus 'unhandled service' candidates.
+        raw_directory = outdir or loot_xml_dir
+        if raw_directory:
+            # Preserve original evidence outside the parseable loot extension.
+            raw_directory.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(xml_path, raw_directory / "tcp_services.xml.raw")
         if cdn:
             _rewrite_cdn_service_xml(xml_path)
 
@@ -2840,7 +2848,7 @@ CLOUDFLARE_SIGNATURE_PORTS = {2052, 2053, 2082, 2083, 2086, 2087, 2095, 2096, 88
 CDN_HEADER_SIGNATURES = {
     "Cloudflare": (("cf-ray", ""), ("cf-cache-status", ""), ("server", "cloudflare")),
     "Railway": (("x-railway-request-id", ""), ("x-railway-edge", ""), ("server", "railway")),
-    "Fastly": (("x-served-by", "cache-"), ("x-fastly-request-id", ""), ("fastly-io-info", ""), ("via", "varnish")),
+    "Fastly": (("x-fastly-request-id", ""), ("fastly-io-info", "")),
     "Akamai": (("x-akamai-request-id", ""), ("server", "akamaighost"), ("x-akamai-transformed", "")),
     "CloudFront": (("x-amz-cf-id", ""), ("x-amz-cf-pop", ""), ("via", "cloudfront")),
     "Vercel": (("x-vercel-id", ""), ("server", "vercel")),
@@ -2892,7 +2900,7 @@ def detect_cdn(ip_addr: str, open_ports: Optional[List[int]] = None,
                         return name
                 except ValueError:
                     continue
-    if open_ports and len(CLOUDFLARE_SIGNATURE_PORTS & set(open_ports)) >= 4:
+    if addr is not None and addr.is_global and open_ports and len(CLOUDFLARE_SIGNATURE_PORTS & set(open_ports)) >= 4:
         return "Cloudflare"
     return None
 
@@ -2961,19 +2969,17 @@ def _cdn_port_kind(port: int) -> Optional[str]:
 
 
 def cdn_edge_services(ports: List[int]) -> List[Service]:
-    """Collapse a CDN edge's open ports into clean http/https web services.
+    """Normalize known web ports, retaining other open ports as unverified leads.
 
-    A CDN fronts one origin over many proxy ports; they are the same L7 door, not
-    distinct services, and nmap can't fingerprint them (it falls back to misleading
-    IANA port-name guesses like cisco-sccp/knetd/radsec). Keep only the web ports,
-    labelled http/https, and drop the non-web edge artefacts — so recon and
-    PathFinder see the real web surface instead of a wall of bogus services. Used
-    on the scan-failure path, where there is no XML to rewrite.
+    CDN attribution is host context, not proof that every observed service is a
+    proxy artifact. Used when no successful service XML is available.
     """
     services: List[Service] = []
     for port in sorted(set(ports)):
         kind = _cdn_port_kind(port)
         if kind is None:
+            services.extend(fallback_services_from_ports([port]))
+            services[-1]['extrainfo'] += '; CDN attribution does not establish origin ownership'
             continue
         services.append({
             "port": str(port),
@@ -2981,7 +2987,7 @@ def cdn_edge_services(ports: List[int]) -> List[Service]:
             "service": kind,
             "product": "",
             "version": "",
-            "extrainfo": "CDN edge proxy port (not an origin service)",
+            "extrainfo": "HTTP proxy candidate on CDN-fronted address; origin ownership is not assessed",
             "tunnel": "ssl" if kind == "https" else "",
             "scripts": "",
         })
@@ -2989,13 +2995,10 @@ def cdn_edge_services(ports: List[int]) -> List[Service]:
 
 
 def _rewrite_cdn_service_xml(xml_path) -> None:
-    """In place: collapse a CDN edge's ports in an nmap service-scan XML.
+    """Normalize table guesses, retaining every port and corroborated fingerprint.
 
-    PathFinder parses this file, so without this it emits one 'unhandled service'
-    candidate per proxy port using nmap's bogus IANA name. Here each web port is
-    relabelled http/https (dropping the misleading name/product/version) and every
-    non-web edge port is removed, leaving the clean web surface. Best-effort: any
-    parse/write error leaves the original file untouched.
+    tcp_service_scan preserves the unmodified XML as .xml.raw before calling
+    this function. Provider attribution never establishes origin ownership.
     """
     try:
         tree = ET.parse(xml_path)
@@ -3012,12 +3015,20 @@ def _rewrite_cdn_service_xml(xml_path) -> None:
             except ValueError:
                 portid = 0
             kind = _cdn_port_kind(portid)
-            if kind is None:
-                ports_el.remove(port_el)
-                continue
             svc_el = port_el.find("service")
             if svc_el is None:
                 svc_el = ET.SubElement(port_el, "service")
+            svc_el.set('omega_cdn', 'true')
+            # A successful fingerprint is evidence, even on a shared address.
+            if svc_el.get('method') == 'probed' and (svc_el.get('product') or svc_el.get('version')):
+                continue
+            if kind is None:
+                svc_el.set('omega_original_name', svc_el.get('name', 'unknown'))
+                svc_el.set('name', 'unknown')
+                for attr in ('product', 'version', 'servicefp', 'ostype'):
+                    svc_el.attrib.pop(attr, None)
+                svc_el.set('extrainfo', 'Unverified service on CDN-fronted address; origin ownership not assessed')
+                continue
             svc_el.set("name", kind)
             svc_el.set("tunnel", "ssl" if kind == "https" else "")
             for attr in ("product", "version", "extrainfo", "servicefp", "ostype"):
@@ -3339,10 +3350,11 @@ def _lootfile(loot: str, name: str) -> str:
 
 def _web_suggestions(host: str, service: Service, loot: str, wordlist: str,
                      power: bool = False,
-                     dns_domains: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+                     dns_domains: Optional[List[str]] = None,
+                     request_host: Optional[str] = None) -> List[Dict[str, Any]]:
     scheme = _web_scheme(service)
     port = _svc_port(service)
-    base = f"{scheme}://{host}:{port}"
+    base = f"{scheme}://{request_host or host}:{port}"
     group = f"web {scheme}:{port}"
     k = " -k" if scheme == "https" else ""
     wl = _bash_arg(wordlist)
@@ -3562,7 +3574,8 @@ def suggest_for_host(host: str,
                      wordlist: str,
                      userlist: str,
                      power: bool = False,
-                     hostname: str = "") -> List[Dict[str, Any]]:
+                     hostname: str = "",
+                     request_host: Optional[str] = None) -> List[Dict[str, Any]]:
     suggestions: List[Dict[str, Any]] = []
     has_smb = False
     has_ad = False
@@ -3582,6 +3595,7 @@ def suggest_for_host(host: str,
             suggestions.extend(_web_suggestions(
                 host, service, host_loot, wordlist, power=power,
                 dns_domains=dns_domains,
+                request_host=request_host or hostname or None,
             ))
         if _svc_name(service) in {"microsoft-ds", "netbios-ssn", "smb"} or port in SMB_PORTS:
             has_smb = True
@@ -4257,6 +4271,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Lightweight nmap wrapper for one-shot initial pentest enumeration."
     )
+    parser.add_argument('--cdn-mode', choices=('auto', 'off'), default='auto',
+                        help='CDN attribution and conservative proxy normalization; off preserves direct-box behaviour.')
+    parser.add_argument('--http-host', help='Explicit HTTP/TLS hostname for follow-up web recon (no scheme or path).')
     parser.add_argument(
         "targets",
         nargs="+",
@@ -4462,6 +4479,8 @@ def parse_args() -> argparse.Namespace:
         help="With --pathfinder, pass through to PathFinder: OSCP exam profile",
     )
     args = parser.parse_args()
+    if args.http_host and not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?', args.http_host):
+        parser.error('--http-host must be a hostname without a scheme, path, port or shell characters.')
     if args.run_timeout < 0:
         parser.error("--run-timeout must be >= 0.")
     if args.scan_timeout < 0:
@@ -4769,12 +4788,12 @@ def main() -> int | None:
         if tcp_open_ports:
             # Edge/CDN attribution only matters for remote targets; a local-fallback
             # (localhost) scan is never behind a CDN, so skip the header probe there.
-            edge_headers = None if use_local_fallback else _probe_edge_headers(hostname or ip_addr, tcp_open_ports)
-            cdn = detect_cdn(ip_addr, tcp_open_ports, headers=edge_headers)
+            edge_headers = None if use_local_fallback or args.cdn_mode == 'off' else _probe_edge_headers(args.http_host or target, tcp_open_ports, tls_mode=args.ai_tls)
+            cdn = None if args.cdn_mode == 'off' else detect_cdn(ip_addr, tcp_open_ports, headers=edge_headers)
             if cdn:
-                info(f"{target}: resolves to a {cdn} edge ({ip_addr}); the open TCP ports "
-                     f"are the {cdn} proxy surface, not origin services. For real L4 "
-                     f"results, scan the origin directly.")
+                info(f"{target}: {cdn} attribution for {ip_addr}; shared-address "
+                     f"ports do not establish origin ownership. Keeping original "
+                     f"scan evidence and corroborated service fingerprints.")
             try:
                 tcp_result = (
                     localhost_tcp_service_scan(target, tcp_open_ports, host_dir)
@@ -4790,12 +4809,11 @@ def main() -> int | None:
                     # The scan "succeeded" but, behind a CDN, its per-port names are
                     # IANA guesses; tcp_service_scan already collapsed them to the
                     # http/https web surface (in the XML PathFinder reads too).
-                    info(f"{target}: {cdn} edge — normalised the proxy ports to "
-                         f"{len(tcp_services)} web service(s); nmap's per-port names "
-                         f"were IANA guesses, not real services.")
+                    info(f"{target}: {cdn} context — retained {len(tcp_services)} "
+                         f"service observation(s), normalising table guesses only.")
                 if llm_options:
                     try:
-                        run_llm_enumeration(target, tcp_services, **llm_options)
+                        run_llm_enumeration(args.http_host or target, tcp_services, **llm_options)
                     except Exception as exc:
                         err(f"{target}: LLM/API enum failed: {exc}")
             except Exception as exc:
@@ -4816,7 +4834,7 @@ def main() -> int | None:
                          f"service(s) from discovered open ports so web recon can run.")
                 if llm_options:
                     try:
-                        run_llm_enumeration(target, tcp_services, **llm_options)
+                        run_llm_enumeration(args.http_host or target, tcp_services, **llm_options)
                     except Exception as exc2:
                         err(f"{target}: LLM/API enum failed: {exc2}")
         else:
@@ -4862,6 +4880,7 @@ def main() -> int | None:
                 LOOT_DIR, DEFAULT_WEB_WORDLIST, DEFAULT_USER_WORDLIST,
                 power=args.power,
                 hostname=hostname,
+                request_host=args.http_host or target,
             )
             if args.pathfinder_suggest:
                 # Use the same pinned host the loot paths are keyed on.

@@ -1465,7 +1465,7 @@ class CdnDetectionTests(unittest.TestCase):
         # An edge whose exact IP isn't baked in is still caught by the proxy-port
         # signature being fully present.
         self.assertEqual(
-            ose.detect_cdn("203.0.113.9", sorted(ose.CLOUDFLARE_PROXY_PORTS)),
+            ose.detect_cdn("8.8.8.8", sorted(ose.CLOUDFLARE_PROXY_PORTS)),
             "Cloudflare",
         )
 
@@ -1474,7 +1474,7 @@ class CdnDetectionTests(unittest.TestCase):
         # in the baked-in ranges — the distinctive-port count still flags Cloudflare.
         ports = [80, 443, 2000, 2052, 2053, 2082, 2083, 2086, 2087, 2096, 5060,
                  8020, 8080, 8443, 8880]
-        self.assertEqual(ose.detect_cdn("203.0.113.9", ports), "Cloudflare")
+        self.assertEqual(ose.detect_cdn("8.8.8.8", ports), "Cloudflare")
 
     def test_invalid_ip_without_signature_is_none(self):
         self.assertIsNone(ose.detect_cdn("not-an-ip", [80, 443]))
@@ -1491,7 +1491,8 @@ class CdnDetectionTests(unittest.TestCase):
 
     def test_cloudfront_and_fastly_detected_by_via_and_served_by(self):
         self.assertEqual(ose.detect_cdn_from_headers({"Via": "1.1 abc.cloudfront.net (CloudFront)"}), "CloudFront")
-        self.assertEqual(ose.detect_cdn_from_headers({"X-Served-By": "cache-lhr-egll1980"}), "Fastly")
+        self.assertIsNone(ose.detect_cdn_from_headers({"X-Served-By": "cache-lhr-egll1980"}))
+        self.assertEqual(ose.detect_cdn_from_headers({"X-Fastly-Request-ID": "fixture"}), "Fastly")
 
     def test_server_header_cloudflare(self):
         self.assertEqual(ose.detect_cdn_from_headers({"Server": "cloudflare"}), "Cloudflare")
@@ -1541,8 +1542,8 @@ class CdnEdgeCollapseTests(unittest.TestCase):
         self.assertEqual(by["2053"]["service"], "https")   # Cloudflare HTTPS port
         self.assertEqual(by["2053"]["tunnel"], "ssl")
         self.assertEqual(by["8880"]["service"], "http")    # Cloudflare HTTP port
-        self.assertNotIn("2000", by)                        # non-web edge artefacts dropped
-        self.assertNotIn("5060", by)
+        self.assertIn("2000", by)                          # retained as unverified inventory
+        self.assertIn("5060", by)
 
     def _cf_scan_xml(self):
         # A service-scan XML like nmap produces against a Cloudflare edge: web ports
@@ -1566,9 +1567,9 @@ class CdnEdgeCollapseTests(unittest.TestCase):
             ose._rewrite_cdn_service_xml(p)
             root = ose.ET.parse(p).getroot()
             ports = {pe.attrib["portid"]: pe.find("service") for pe in root.iter("port")}
-            # Non-web edge ports are removed entirely.
-            self.assertNotIn("2000", ports)
-            self.assertNotIn("5060", ports)
+            # Non-web observations survive without misleading IANA guesses.
+            self.assertEqual(ports["2000"].attrib['name'], 'unknown')
+            self.assertEqual(ports["5060"].attrib['name'], 'unknown')
             # Web ports kept and relabelled; bogus product/version stripped.
             self.assertEqual(ports["2053"].attrib["name"], "https")
             self.assertEqual(ports["2053"].attrib.get("tunnel"), "ssl")

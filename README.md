@@ -146,6 +146,23 @@ to the proxy/CDN; the network scan does not reveal the hidden origin server.
 
 ## Workflow
 
+### CDN context and virtual hosts
+
+CDN detection uses provider headers, known Cloudflare ranges and a public-IP
+port-pattern heuristic. Generic Varnish/cache headers and a private address's
+port pattern do not establish a CDN. Every open port remains inventory;
+corroborated Nmap products/versions are retained. Table guesses on known proxy
+ports are normalized and other guesses remain unverified. Original service XML
+is saved as `tcp_services.xml.raw` alongside normalized evidence. PathFinder's
+auto-detection skips the original so it is not counted twice.
+
+Use `--cdn-mode off` to disable CDN attribution/normalization for a direct-box
+workflow. Hostname targets remain the HTTP/TLS host for follow-up web commands;
+loot remains keyed by observed IP. `--http-host app.example.test` explicitly
+selects a virtual host when scanning an IP. It does not prove origin ownership.
+Partial enumeration exits 2 with usable loot; complete discovery failure exits 1.
+Wrappers should retain evidence on a partial exit rather than discard it.
+
 1. Runs TCP discovery with `nmap -Pn -p- --open` unless `--ports` is supplied.
 2. Runs `nmap -sC -sV` only against discovered ports.
 3. Checks HTTP-like services for AI, model, RAG, MCP, and agent surfaces.
