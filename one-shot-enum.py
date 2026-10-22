@@ -40,6 +40,7 @@ Features:
 import argparse
 import csv
 import hashlib
+from html.parser import HTMLParser
 import ipaddress
 import json
 import os
@@ -1583,6 +1584,49 @@ def is_interesting_probe_response(response: Dict[str, Any]) -> bool:
     return 200 <= status < 400 or status in (400, 401, 403, 405, 422)
 
 
+class _GateHTMLFingerprint(HTMLParser):
+    """Canonical HTML events; only script/style CSP nonce values are volatile.
+
+    Preserve text, comments, scripts, attribute values and duplicate attribute
+    order. Equal titles/statuses/sizes are not sufficient to identify a gate.
+    """
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self.parts = []
+
+    def handle_starttag(self, tag, attrs):
+        self.parts.append(('start', tag, [(key, '[csp nonce]' if key == 'nonce' and tag in ('script', 'style') else value)
+                                          for key, value in attrs]))
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        self.parts.append(('self-closing',))
+
+    def handle_endtag(self, tag):
+        self.parts.append(('end', tag))
+
+    def handle_data(self, data):
+        self.parts.append(('data', data))
+
+    def handle_comment(self, data):
+        self.parts.append(('comment', data))
+
+    def handle_decl(self, decl):
+        self.parts.append(('decl', decl))
+
+    def handle_entityref(self, name):
+        self.parts.append(('entity', name))
+
+    def handle_charref(self, name):
+        self.parts.append(('char', name))
+
+    def handle_pi(self, data):
+        self.parts.append(('processing', data))
+
+    def unknown_decl(self, data):
+        self.parts.append(('unknown-declaration', data))
+
+
 def _response_fingerprint(response: Dict[str, Any], request_path: str = '') -> Optional[Tuple[Any, ...]]:
     """Recognise a repeated gate without equating unrelated same-size bodies.
 
@@ -1605,6 +1649,14 @@ def _response_fingerprint(response: Dict[str, Any], request_path: str = '') -> O
     # Equal length is not equal content. Keep genuine same-size API responses
     # distinct; a catch-all must agree on its normalized response body.
     normalized = json.dumps(response['json'], sort_keys=True, separators=(',', ':')) if response.get('json') is not None else re.sub(r'\s+', ' ', body).strip()
+    if family == 'html':
+        try:
+            parser = _GateHTMLFingerprint()
+            parser.feed(body)
+            parser.close()
+            normalized = json.dumps(parser.parts, separators=(',', ':'))
+        except (ValueError, RecursionError):
+            pass  # Preserve the original body hash when canonicalization fails.
     if not 200 <= status < 300:
         if request_path:
             normalized = normalized.replace(request_path, '[requested path]')

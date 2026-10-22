@@ -9,6 +9,9 @@ responses, rather than treating equal lengths or statuses as equal services.
 Baseline flags, protocol corroboration and fingerprints survive the PathFinder
 handoff. Baseline-only probes remain in raw loot without implying an AI service
 or routing active confirmation from the gate-page match.
+HTML comparison ignores rotating CSP nonce values only on script/style tags.
+Other attributes, text, scripts and JSON values remain significant; equal
+title/status/size alone cannot identify a shared gate.
 
 ## Install and verify
 
